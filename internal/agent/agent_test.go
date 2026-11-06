@@ -704,7 +704,7 @@ func TestParseStream(t *testing.T) {
 		"fenced":  "```json\n" + good + "\n```",
 		"wrapped": "결과입니다.\n" + good + "\n끝.",
 	} {
-		res, err := parseStream(strings.NewReader(final(text)))
+		res, err := parseStream(strings.NewReader(final(text)), noEmit)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -720,7 +720,7 @@ func TestParseStream(t *testing.T) {
 		"max turns":  `{"type":"result","subtype":"error_max_turns","is_error":true}`,
 		"is_error":   `{"type":"result","subtype":"success","is_error":true,"result":"{\"summary\":\"x\"}"}`,
 	} {
-		if _, err := parseStream(strings.NewReader(stream)); err == nil {
+		if _, err := parseStream(strings.NewReader(stream), noEmit); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
@@ -907,11 +907,11 @@ func TestParseStreamLevel(t *testing.T) {
 		ev, _ := json.Marshal(map[string]any{"type": "result", "subtype": "success", "result": string(final)})
 		return string(ev) + "\n"
 	}
-	res, err := parseStream(strings.NewReader(line("critical")))
+	res, err := parseStream(strings.NewReader(line("critical")), noEmit)
 	if err != nil || res.Level != "critical" || res.Feedback[0] != "a" || res.Fixes[0] != "b" {
 		t.Fatalf("%+v %v", res, err)
 	}
-	if res, err = parseStream(strings.NewReader(line("panic"))); err != nil || res.Level != "" {
+	if res, err = parseStream(strings.NewReader(line("panic")), noEmit); err != nil || res.Level != "" {
 		t.Fatalf("unknown level must be dropped: %+v %v", res, err)
 	}
 }
@@ -1038,5 +1038,38 @@ func TestLinkDropDeniesAPendingPermission(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("hook did not return")
+	}
+}
+
+func noEmit(string, string) {}
+
+func TestParseStreamEmitsProgress(t *testing.T) {
+	long := strings.Repeat("a", maxStreamText) + "tail"
+	lines := []string{
+		`{"type":"system","subtype":"init"}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"상태를 봅니다"},{"type":"tool_use","name":"Bash","input":{"command":"uptime"}}]}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","content":"up 3 days"}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/etc/hosts"}}]}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"` + long + `"}]}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"{\"summary\":\"끝\"}"}]}}`,
+		`{"type":"result","subtype":"success","result":"{\"summary\":\"끝\"}"}`,
+	}
+	var got [][2]string
+	if _, err := parseStream(strings.NewReader(strings.Join(lines, "\n")), func(kind, text string) {
+		got = append(got, [2]string{kind, text})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("entries = %q", got)
+	}
+	want := [][2]string{{"text", "상태를 봅니다"}, {"command", "uptime"}, {"output", "up 3 days"}, {"command", "Read /etc/hosts"}}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("entry %d = %q, want %q", i, got[i], w)
+		}
+	}
+	if last := got[4]; last[0] != "output" || len(last[1]) != maxStreamText || !strings.HasSuffix(last[1], "tail") {
+		t.Errorf("long output = %s %d", last[0], len(last[1]))
 	}
 }

@@ -149,7 +149,9 @@ func (a *Agent) invokeClaude(ctx context.Context, m incoming) (*consultResult, e
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	res, parseErr := parseStream(stdout)
+	res, parseErr := parseStream(stdout, func(kind, text string) {
+		a.send(streamMsg{Type: "consultation_stream", ConsultationID: m.ConsultationID, Kind: kind, Text: text})
+	})
 	waitErr := cmd.Wait()
 	if parseErr != nil {
 		return nil, errors.Join(parseErr, waitErr)
@@ -310,9 +312,81 @@ type consultResult struct {
 	Recommendations []recommendation `json:"recommendations"`
 }
 
-// parseStream reads claude's stream-json output and decodes the final answer.
-// Lines before the result event are progress; the hooks record what matters.
-func parseStream(r io.Reader) (*consultResult, error) {
+// maxStreamText bounds one progress entry; a long command output keeps its tail,
+// which is where the result and the errors are.
+const maxStreamText = 4000
+
+// emitProgress turns one stream-json line into what the owner watches live:
+// Claude's words, the commands it starts, and their output.
+func emitProgress(line []byte, emit func(kind, text string)) {
+	var ev struct {
+		Type    string `json:"type"`
+		Message struct {
+			Content []struct {
+				Type    string          `json:"type"`
+				Text    string          `json:"text"`
+				Name    string          `json:"name"`
+				Input   json.RawMessage `json:"input"`
+				Content json.RawMessage `json:"content"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(line, &ev) != nil || (ev.Type != "assistant" && ev.Type != "user") {
+		return
+	}
+	send := func(kind, text string) {
+		text = strings.TrimSpace(strings.ToValidUTF8(text, ""))
+		if len(text) > maxStreamText {
+			text = strings.ToValidUTF8(text[len(text)-maxStreamText:], "")
+		}
+		if text != "" {
+			emit(kind, text)
+		}
+	}
+	for _, block := range ev.Message.Content {
+		switch block.Type {
+		case "text":
+			// The final answer is the report JSON; the page renders that itself.
+			if t := strings.TrimSpace(block.Text); !strings.HasPrefix(t, "{") && !strings.HasPrefix(t, "```") {
+				send("text", t)
+			}
+		case "tool_use":
+			var input struct {
+				Command  string `json:"command"`
+				FilePath string `json:"file_path"`
+			}
+			_ = json.Unmarshal(block.Input, &input)
+			if input.Command != "" {
+				send("command", input.Command)
+			} else {
+				send("command", strings.TrimSpace(block.Name+" "+input.FilePath))
+			}
+		case "tool_result":
+			send("output", toolResultText(block.Content))
+		}
+	}
+}
+
+// toolResultText reads a tool result, which is either a string or a list of text blocks.
+func toolResultText(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var parts []struct {
+		Text string `json:"text"`
+	}
+	_ = json.Unmarshal(raw, &parts)
+	var b strings.Builder
+	for _, part := range parts {
+		b.WriteString(part.Text)
+	}
+	return b.String()
+}
+
+// parseStream reads claude's stream-json output, reports progress to emit, and
+// decodes the final answer.
+func parseStream(r io.Reader, emit func(kind, text string)) (*consultResult, error) {
 	var final *struct {
 		IsError bool   `json:"is_error"`
 		Subtype string `json:"subtype"`
@@ -321,6 +395,7 @@ func parseStream(r io.Reader) (*consultResult, error) {
 	s := bufio.NewScanner(r)
 	s.Buffer(make([]byte, 64*1024), 64<<20)
 	for s.Scan() {
+		emitProgress(s.Bytes(), emit)
 		var ev struct {
 			Type string `json:"type"`
 		}

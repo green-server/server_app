@@ -62,6 +62,15 @@ type consultationStatusMsg struct {
 	Recommendations  []recommendation `json:"recommendations,omitempty"`
 }
 
+// streamMsg is best effort: a line lost while disconnected only leaves a gap in
+// the live view, and the hooks still record every command.
+type streamMsg struct {
+	Type           string `json:"type"`
+	ConsultationID int64  `json:"consultationId"`
+	Kind           string `json:"kind"`
+	Text           string `json:"text"`
+}
+
 type undoResultMsg struct {
 	Type       string `json:"type"`
 	ToolCallID int64  `json:"toolCallId"`
