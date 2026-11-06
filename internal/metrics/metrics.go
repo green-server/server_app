@@ -130,9 +130,9 @@ func isVirtual(root string) bool {
 	return err == nil && strings.Contains(string(data), " hypervisor")
 }
 
-// readRAPL returns average package watts since the previous call. It only
-// sums top-level zones: subzones are already inside their package, and psys
-// overlaps the packages.
+// readRAPL returns average package plus DRAM watts since the previous call.
+// core and uncore are already inside their package, and psys overlaps it, but
+// the dram subzone is a separate rail the package counter does not include.
 //
 // The kernel makes energy_uj root-only by default; install.sh grants the
 // greenserver group read access. Unreadable falls back to estimation.
@@ -150,11 +150,13 @@ func (s *Sampler) readRAPL(now time.Time) (float64, bool) {
 	complete := true
 	for _, e := range entries {
 		// intel-rapl:0 is a package, intel-rapl:0:0 its subzone. AMD uses the same names.
-		if !strings.HasPrefix(e.Name(), "intel-rapl:") || strings.Count(e.Name(), ":") != 1 {
+		if !strings.HasPrefix(e.Name(), "intel-rapl:") {
 			continue
 		}
 		dir := filepath.Join(base, e.Name())
-		if name, _ := os.ReadFile(filepath.Join(dir, "name")); strings.TrimSpace(string(name)) == "psys" {
+		data, _ := os.ReadFile(filepath.Join(dir, "name"))
+		name := strings.TrimSpace(string(data))
+		if top := strings.Count(e.Name(), ":") == 1; top && name == "psys" || !top && name != "dram" {
 			continue
 		}
 		energy, err := readUint(filepath.Join(dir, "energy_uj"))

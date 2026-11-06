@@ -89,6 +89,21 @@ func TestRAPLIgnoresSubzonesAndPsys(t *testing.T) {
 	}
 }
 
+func TestRAPLAddsDRAM(t *testing.T) {
+	root, file := raplRoot(t, "0\n")
+	dram := filepath.Join(root, "sys/class/powercap/intel-rapl:0:2")
+	write(t, filepath.Join(dram, "name"), "dram\n")
+	write(t, filepath.Join(dram, "energy_uj"), "0\n")
+	s := newSampler(Profile{10, 100}, root)
+	start := time.Now()
+	s.readRAPL(start)
+	write(t, file, "10000000\n")
+	write(t, filepath.Join(dram, "energy_uj"), "5000000\n")
+	if w, ok := s.readRAPL(start.Add(10 * time.Second)); !ok || !near(w, 1.5) {
+		t.Fatalf("got %v %v, want package plus dram: 1.5 W", w, ok)
+	}
+}
+
 func TestRAPLUnreadableFallsBack(t *testing.T) {
 	root, file := raplRoot(t, "1000\n")
 	s := newSampler(Profile{10, 100}, root)
