@@ -50,14 +50,15 @@ type recommendation struct {
 }
 
 type consultationStatusMsg struct {
-	Type            string           `json:"type"`
-	ConsultationID  int64            `json:"consultationId"`
-	Status          string           `json:"status"`
-	Summary         string           `json:"summary,omitempty"`
-	Level           string           `json:"level,omitempty"`
-	Feedback        []string         `json:"feedback,omitempty"`
-	Fixes           []string         `json:"fixes,omitempty"`
-	Recommendations []recommendation `json:"recommendations,omitempty"`
+	Type             string           `json:"type"`
+	ConsultationID   int64            `json:"consultationId"`
+	Status           string           `json:"status"`
+	Summary          string           `json:"summary,omitempty"`
+	Level            string           `json:"level,omitempty"`
+	Feedback         []string         `json:"feedback,omitempty"`
+	Fixes            []string         `json:"fixes,omitempty"`
+	RecommendationID int64            `json:"recommendationId,omitempty"`
+	Recommendations  []recommendation `json:"recommendations,omitempty"`
 }
 
 type undoResultMsg struct {
@@ -68,13 +69,15 @@ type undoResultMsg struct {
 
 // incoming is the union of backend-to-agent messages.
 type incoming struct {
-	Type           string `json:"type"`
-	ConsultationID int64  `json:"consultationId"`
-	AuthMode       string `json:"authMode"`
-	MaxTurns       int    `json:"maxTurns"`
-	Model          string `json:"model"`
-	ToolCallID     int64  `json:"toolCallId"`
-	Command        string `json:"command"`
+	Type             string `json:"type"`
+	ConsultationID   int64  `json:"consultationId"`
+	AuthMode         string `json:"authMode"`
+	MaxTurns         int    `json:"maxTurns"`
+	Model            string `json:"model"`
+	RecommendationID int64  `json:"recommendationId"`
+	Task             string `json:"task"`
+	ToolCallID       int64  `json:"toolCallId"`
+	Command          string `json:"command"`
 }
 
 // Local socket protocol: one JSON request line, one JSON response line.
