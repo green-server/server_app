@@ -79,8 +79,6 @@ func preHook(in hookInput, stdout, stderr io.Writer, socket string) int {
 		fmt.Fprintln(stderr, "greenserver: blocked:", resp.Message)
 		return 2
 	}
-	// An approve-tier call only gets here after the owner approved it: the agent
-	// answered from waitForDecision. Stays silent, so a hook can only tighten.
 	return 0
 }
 

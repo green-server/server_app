@@ -14,7 +14,7 @@ curl -fsSL https://raw.githubusercontent.com/green-server/server_app/main/instal
 | 옵션 | 설명 |
 |---|---|
 | `--server URL` | 백엔드 주소. 필수 |
-| `--services a,b` | AI가 승인을 받아 중지, 시작, 재시작할 수 있는 서비스. 생략하면 없음 |
+| `--services a,b` | AI가 승인 없이 중지, 시작, 재시작할 수 있는 서비스. 생략하면 없음 |
 | `--idle-watts N`, `--max-watts N` | RAPL이 없을 때 쓰는 전력 프로필 |
 | `--binary PATH` | 릴리스를 내려받지 않고 이 파일을 설치 |
 
@@ -56,7 +56,7 @@ greenserver version
 | 단계 | 처리 |
 |---|---|
 | auto | 읽기와 상태 확인. 바로 실행 |
-| approve | 상태를 바꾸는 명령과 알 수 없는 명령. 웹 승인 후 실행 |
+| approve | 상태를 바꾸는 명령과 알 수 없는 명령. 되돌리는 명령이 있으면 승인 없이 실행 |
 | deny | 항상 차단 |
 
 분류기는 `internal/classify`에 있고, 복합 명령을 나눠 가장 엄격한 결과를 따릅니다. 모르는 명령은 auto가 될 수 없습니다. PreToolUse 훅, 승인 도구, 에이전트가 같은 분류기를 각자 다시 호출합니다. 승인 대기는 10분이 지나거나 백엔드 연결이 끊기면 거부로 처리합니다.
@@ -74,7 +74,7 @@ sudo -n systemctl stop minecraft # undo: sudo -n systemctl start minecraft
 - 되돌리기 명령도 분류기를 거치며 approve 등급이어야 합니다. `true` 같은 빈 명령이나 금지 명령은 없는 것으로 처리합니다.
 - 되돌리기가 없는 approve 명령은 웹에 묻지 않고 거부합니다.
 - 파일 수정은 Edit 도구를 막고 Bash로만 하므로 모든 변경이 같은 규칙을 따릅니다.
-- `undo` 메시지는 이 에이전트가 승인된 조치와 함께 기록한 문자열과 정확히 같을 때만 실행합니다. 그 외에는 실행하지 않고 `exitCode: 126`으로 응답합니다.
+- `undo` 메시지는 이 에이전트가 조치와 함께 기록한 문자열과 정확히 같을 때만 실행합니다. 그 외에는 실행하지 않고 `exitCode: 126`으로 응답합니다.
 
 ## 개발
 

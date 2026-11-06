@@ -73,8 +73,6 @@ type incoming struct {
 	AuthMode       string `json:"authMode"`
 	MaxTurns       int    `json:"maxTurns"`
 	Model          string `json:"model"`
-	RequestID      string `json:"requestId"`
-	Decision       string `json:"decision"`
 	ToolCallID     int64  `json:"toolCallId"`
 	Command        string `json:"command"`
 }

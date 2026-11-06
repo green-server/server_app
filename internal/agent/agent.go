@@ -55,19 +55,14 @@ type Agent struct {
 	audit   *auditLog
 
 	metricsEvery time.Duration
-	approvalWait time.Duration
 	backoffBase  time.Duration
 	backoffMax   time.Duration
 	runUndo      func(ctx context.Context, command string) int
 
-	mu      sync.Mutex // also serializes WebSocket writes
-	conn    *websocket.Conn
-	down    chan struct{} // closed when the current link drops
-	queue   [][]byte      // reliable messages waiting for a link
-	pending map[string]chan string
-	useIDs  map[string]string // command -> tool_use_id, seen by the pre hook
-	granted map[string]bool   // command approved by the pre hook, for the prompt tool that may follow
-	active  *consultation
+	mu     sync.Mutex // also serializes WebSocket writes
+	conn   *websocket.Conn
+	queue  [][]byte // reliable messages waiting for a link
+	active *consultation
 }
 
 func New(cfg Config) (*Agent, error) {
@@ -92,13 +87,9 @@ func New(cfg Config) (*Agent, error) {
 		url:          u,
 		audit:        &auditLog{path: filepath.Join(cfg.StateDir, "audit.jsonl")},
 		metricsEvery: 10 * time.Second,
-		approvalWait: 10 * time.Minute,
 		backoffBase:  time.Second,
 		backoffMax:   time.Minute,
 		runUndo:      shellUndo,
-		pending:      map[string]chan string{},
-		useIDs:       map[string]string{},
-		granted:      map[string]bool{},
 	}, nil
 }
 
@@ -233,7 +224,7 @@ func (a *Agent) attach(ctx context.Context, conn *websocket.Conn) error {
 		}
 		a.queue = a.queue[1:]
 	}
-	a.conn, a.down = conn, make(chan struct{})
+	a.conn = conn
 	return nil
 }
 
@@ -241,7 +232,6 @@ func (a *Agent) detach() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.conn = nil
-	close(a.down) // every approval waiting on this link is now denied
 }
 
 func write(ctx context.Context, conn *websocket.Conn, data []byte) error {
@@ -294,14 +284,6 @@ func (a *Agent) handle(ctx context.Context, m incoming) {
 	switch m.Type {
 	case "consultation_start":
 		a.startConsultation(ctx, m)
-	case "decision":
-		a.mu.Lock()
-		ch, ok := a.pending[m.RequestID]
-		delete(a.pending, m.RequestID)
-		a.mu.Unlock()
-		if ok {
-			ch <- m.Decision
-		}
 	case "undo":
 		go a.handleUndo(ctx, m.ToolCallID, m.Command)
 	}
@@ -453,66 +435,28 @@ func (a *Agent) preCheck(c *consultation, req ipcRequest, v classify.Verdict) ip
 		a.sendReliable(toolCallMsg{"tool_call", c.id, req.ToolUseID, v.Command, v.Tier, "auto", nil})
 		a.logCall(c, req.ToolUseID, v, "auto")
 	default:
-		// Web approval happens here, not in the prompt tool: auto mode may never
-		// call the prompt tool, and an approve-tier command must not run unasked.
-		a.mu.Lock()
-		a.useIDs[v.Command] = req.ToolUseID
-		a.mu.Unlock()
-		resp := a.requestApproval(c, req, v)
-		if resp.Allow {
-			a.mu.Lock()
-			a.granted[v.Command] = true
-			a.mu.Unlock()
+		// Runs without a human: every consultation is auto. Recorded first, because
+		// the audit log is the undo ledger and an action must not run unrecorded.
+		if err := a.logCall(c, req.ToolUseID, v, "auto"); err != nil {
+			return ipcResponse{Message: "undo could not be recorded"}
 		}
-		return resp
+		a.sendReliable(toolCallMsg{"tool_call", c.id, req.ToolUseID, v.Command, v.Tier, "auto", undoPtr(v)})
 	}
 	return ipcResponse{Allow: true}
 }
 
+// approve answers the prompt tool. The pre hook already recorded the call, so
+// the only refusal left here is the classifier's own.
 func (a *Agent) approve(c *consultation, req ipcRequest, v classify.Verdict) ipcResponse {
 	if v.Blocked {
-		a.reportBlocked(c, a.requestID(req, v), v)
+		id := req.ToolUseID
+		if id == "" {
+			id = fmt.Sprintf("gs-%d-%d", time.Now().UnixNano(), rand.Int64())
+		}
+		a.reportBlocked(c, id, v)
 		return ipcResponse{Message: v.Reason}
 	}
-	if v.Tier == classify.Auto {
-		return ipcResponse{Allow: true}
-	}
-	a.mu.Lock()
-	granted := a.granted[v.Command]
-	delete(a.granted, v.Command)
-	a.mu.Unlock()
-	if granted {
-		return ipcResponse{Allow: true}
-	}
-	return a.requestApproval(c, req, v)
-}
-
-func (a *Agent) requestApproval(c *consultation, req ipcRequest, v classify.Verdict) ipcResponse {
-	id := a.requestID(req, v)
-	decision := a.waitForDecision(c, id, v)
-	// The audit log is the undo ledger. An action whose undo could not be
-	// recorded must not run, because the web would offer an undo we refuse.
-	if err := a.logCall(c, id, v, decision); err != nil && decision == "approved" {
-		decision = "undo could not be recorded"
-	}
-	if decision != "approved" {
-		a.sendReliable(toolResultMsg{"tool_result", id, nil})
-		return ipcResponse{Message: "denied: " + decision}
-	}
 	return ipcResponse{Allow: true}
-}
-
-func (a *Agent) requestID(req ipcRequest, v classify.Verdict) string {
-	if req.ToolUseID != "" {
-		return req.ToolUseID
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if id := a.useIDs[v.Command]; id != "" {
-		delete(a.useIDs, v.Command)
-		return id
-	}
-	return fmt.Sprintf("gs-%d-%d", time.Now().UnixNano(), rand.Int64())
 }
 
 func (a *Agent) reportBlocked(c *consultation, id string, v classify.Verdict) {
@@ -525,50 +469,6 @@ func undoPtr(v classify.Verdict) *string {
 		return nil
 	}
 	return &v.Undo
-}
-
-// waitForDecision returns "approved" or why it was not. Only an explicit
-// approved over a live link counts: silence, a dropped link or anything
-// malformed is a denial.
-func (a *Agent) waitForDecision(c *consultation, id string, v classify.Verdict) string {
-	data, err := json.Marshal(toolCallMsg{"tool_call", c.id, id, v.Command, v.Tier, "pending", undoPtr(v)})
-	if err != nil {
-		return "unencodable request"
-	}
-	ch := make(chan string, 1)
-	a.mu.Lock()
-	if _, dup := a.pending[id]; dup {
-		a.mu.Unlock()
-		return "duplicate request"
-	}
-	if !a.writeLocked(data) {
-		a.mu.Unlock()
-		return "backend link is down"
-	}
-	a.pending[id] = ch
-	down := a.down
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		delete(a.pending, id)
-		a.mu.Unlock()
-	}()
-
-	timer := time.NewTimer(a.approvalWait)
-	defer timer.Stop()
-	select {
-	case d := <-ch:
-		if d == "approved" {
-			return d
-		}
-		return "denied by the owner"
-	case <-timer.C:
-		return "approval timed out"
-	case <-down:
-		return "backend link dropped"
-	case <-c.ctx.Done():
-		return "consultation ended"
-	}
 }
 
 func (a *Agent) recordResult(c *consultation, req ipcRequest) {
@@ -588,8 +488,8 @@ func (a *Agent) logCall(c *consultation, id string, v classify.Verdict, decision
 	return err
 }
 
-// auditRecord is one line of the local audit log. Lines with a Decision of
-// approved are also the ledger that an undo request is checked against, so
+// auditRecord is one line of the local audit log. Lines carrying an Undo are
+// also the ledger that an undo request is checked against, so
 // undo works across restarts.
 type auditRecord struct {
 	TS             string        `json:"ts"`
@@ -641,7 +541,7 @@ func (l *auditLog) hasUndo(command string) bool {
 	s.Buffer(make([]byte, 64*1024), 1<<20)
 	for s.Scan() {
 		var r auditRecord
-		if json.Unmarshal(s.Bytes(), &r) == nil && r.Decision == "approved" && r.Undo == command {
+		if json.Unmarshal(s.Bytes(), &r) == nil && (r.Decision == "auto" || r.Decision == "approved") && r.Undo == command {
 			return true
 		}
 	}

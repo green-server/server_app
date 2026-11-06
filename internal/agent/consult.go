@@ -21,12 +21,6 @@ const (
 	approveTool = "mcp__" + serverName + "__approve"
 
 	consultTimeout = 2 * time.Hour
-
-	// Claude Code's own limit on one MCP call. It must outlast the 10 minute
-	// approval window, or a slow human would look like a failed tool.
-	mcpToolTimeoutMS = "660000"
-
-	hookTimeoutSeconds = 660
 )
 
 // Bash and Read are the only built-in tools Claude gets. Edit and Write are
@@ -95,8 +89,6 @@ func (a *Agent) startConsultation(ctx context.Context, m incoming) {
 		defer func() {
 			a.mu.Lock()
 			a.active = nil
-			clear(a.useIDs)
-			clear(a.granted)
 			a.mu.Unlock()
 			cancel()
 		}()
@@ -155,10 +147,7 @@ func (a *Agent) invokeClaude(ctx context.Context, m incoming) (*consultResult, e
 func claudeArgs(model string, maxTurns int, exe, socket string) []string {
 	hook := func(kind string) []map[string]any {
 		command := fmt.Sprintf("%s hook %s --socket %s", shellQuote(exe), kind, shellQuote(socket))
-		return []map[string]any{{"matcher": "*", "hooks": []map[string]any{
-			// The pre hook waits for the web decision, so it must outlast the approval window.
-			{"type": "command", "command": command, "timeout": hookTimeoutSeconds},
-		}}}
+		return []map[string]any{{"matcher": "*", "hooks": []map[string]string{{"type": "command", "command": command}}}}
 	}
 	settings := mustJSON(map[string]any{"hooks": map[string]any{
 		"PreToolUse":  hook("pre"),
@@ -203,26 +192,26 @@ func shellQuote(s string) string {
 // never reaches Claude. In subscription mode the API key variables must go,
 // or claude would bill the key instead of using the owner's login.
 func childEnv(environ []string, authMode string) []string {
-	drop := map[string]bool{"GREENSERVER_TOKEN": true, "MCP_TOOL_TIMEOUT": true}
+	drop := map[string]bool{"GREENSERVER_TOKEN": true}
 	if authMode != "api_key" {
 		drop["ANTHROPIC_API_KEY"] = true
 		drop["ANTHROPIC_AUTH_TOKEN"] = true
 	}
-	out := make([]string, 0, len(environ)+1)
+	out := make([]string, 0, len(environ))
 	for _, kv := range environ {
 		name, _, _ := strings.Cut(kv, "=")
 		if !drop[name] {
 			out = append(out, kv)
 		}
 	}
-	return append(out, "MCP_TOOL_TIMEOUT="+mcpToolTimeoutMS)
+	return out
 }
 
 func buildPrompt(stateDir string) string {
 	return strings.ReplaceAll(promptTemplate, "{{METRICS}}", latestPath(stateDir))
 }
 
-const promptTemplate = `당신은 이 서버 안에서 실행 중인 Green Server 전력 컨설턴트입니다. 이 서버의 전력 낭비를 진단하고, 승인을 받아 조치한 뒤 결과를 보고하세요.
+const promptTemplate = `당신은 이 서버 안에서 실행 중인 Green Server 전력 컨설턴트입니다. 이 서버의 전력 낭비를 진단하고, 조치한 뒤 결과를 보고하세요.
 
 최신 측정값은 {{METRICS}} 파일에 있고 10초마다 갱신됩니다. isEstimated가 true면 실측이 아니라 추정값이며, 그렇게 표시해서 보고하세요.
 
@@ -238,7 +227,7 @@ const promptTemplate = `당신은 이 서버 안에서 실행 중인 Green Serve
 
 쓸 수 있는 도구는 Bash와 Read뿐입니다. 파일 수정도 Bash로 합니다.
 
-읽기 명령은 바로 실행됩니다. 상태를 바꾸는 명령은 웹에서 사람이 승인해야 실행됩니다. 이런 명령은 맨 끝에 되돌리는 명령을 주석으로 붙이세요. 없으면 승인 요청 없이 거부됩니다.
+모든 명령은 사람의 승인 없이 바로 실행됩니다. 그러니 상태를 바꾸기 전에 측정값과 접속자를 먼저 확인하세요. 상태를 바꾸는 명령은 맨 끝에 되돌리는 명령을 주석으로 붙이세요. 없으면 거부됩니다.
 
     sudo -n systemctl stop minecraft # undo: sudo -n systemctl start minecraft
 

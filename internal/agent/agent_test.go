@@ -108,7 +108,6 @@ func newAgent(t *testing.T, url string) *Agent {
 	}
 	a.metricsEvery = 20 * time.Millisecond
 	a.backoffBase = 10 * time.Millisecond
-	a.approvalWait = 5 * time.Second
 	a.runUndo = func(context.Context, string) int {
 		t.Error("undo must not run in this test")
 		return 1
@@ -287,108 +286,6 @@ func TestSocketIsPrivate(t *testing.T) {
 	}
 }
 
-func TestApprovalApproved(t *testing.T) {
-	a, b, c := connected(t)
-	ch := ask(a, "req-1", stopNginx)
-	m := b.expect("tool_call")
-	if m["decision"] != "pending" || m["tier"] != "approve" || m["requestId"] != "req-1" || m["consultationId"] != float64(7) ||
-		m["command"] != "sudo -n systemctl stop nginx" || m["undoCommand"] != "sudo -n systemctl start nginx" {
-		t.Fatalf("%v", m)
-	}
-	tell(t, c, map[string]string{"type": "decision", "requestId": "req-1", "decision": "approved"})
-	if r := result(t, ch); !r.Allow {
-		t.Fatalf("%+v", r)
-	}
-}
-
-func TestApprovalDenied(t *testing.T) {
-	a, b, c := connected(t)
-	ch := ask(a, "req-2", stopNginx)
-	b.expect("tool_call")
-	tell(t, c, map[string]string{"type": "decision", "requestId": "req-2", "decision": "denied"})
-	if r := result(t, ch); r.Allow {
-		t.Fatalf("%+v", r)
-	}
-	if m := b.expect("tool_result"); m["requestId"] != "req-2" || m["exitCode"] != nil {
-		t.Fatalf("%v", m)
-	}
-}
-
-func TestOnlyExactApprovedCounts(t *testing.T) {
-	a, b, c := connected(t)
-	for i, d := range []string{"Approved", "yes", "", "true"} {
-		id := fmt.Sprint("req-x", i)
-		ch := ask(a, id, stopNginx)
-		b.expect("tool_call")
-		tell(t, c, map[string]string{"type": "decision", "requestId": id, "decision": d})
-		if r := result(t, ch); r.Allow {
-			t.Fatalf("decision %q allowed", d)
-		}
-	}
-}
-
-func TestDecisionForAnotherRequestIgnored(t *testing.T) {
-	a, b, c := connected(t)
-	a.approvalWait = 100 * time.Millisecond
-	ch := ask(a, "req-3", stopNginx)
-	b.expect("tool_call")
-	tell(t, c, map[string]string{"type": "decision", "requestId": "someone-else", "decision": "approved"})
-	if r := result(t, ch); r.Allow {
-		t.Fatalf("%+v", r)
-	}
-}
-
-func TestApprovalTimesOut(t *testing.T) {
-	a, b, _ := connected(t)
-	a.approvalWait = 50 * time.Millisecond
-	ch := ask(a, "req-4", stopNginx)
-	b.expect("tool_call")
-	r := result(t, ch)
-	if r.Allow || !strings.Contains(r.Message, "timed out") {
-		t.Fatalf("%+v", r)
-	}
-	if m := b.expect("tool_result"); m["requestId"] != "req-4" || m["exitCode"] != nil {
-		t.Fatalf("backend must learn the request is over: %v", m)
-	}
-}
-
-func TestDefaultApprovalWaitIsTenMinutes(t *testing.T) {
-	a, err := New(Config{Server: "wss://x", Token: "t", StateDir: stateDir(t), Profile: metrics.Profile{MaxWatts: 10}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a.approvalWait != 10*time.Minute {
-		t.Fatal(a.approvalWait)
-	}
-}
-
-func TestLinkDropDeniesPendingApproval(t *testing.T) {
-	a, b, c := connected(t)
-	ch := ask(a, "req-5", stopNginx)
-	b.expect("tool_call")
-	c.CloseNow()
-	r := result(t, ch)
-	if r.Allow || !strings.Contains(r.Message, "link dropped") {
-		t.Fatalf("%+v", r)
-	}
-	// A decision after reconnecting cannot bring it back.
-	c2 := b.conn()
-	tell(t, c2, map[string]string{"type": "decision", "requestId": "req-5", "decision": "approved"})
-	if m := b.expect("tool_result"); m["requestId"] != "req-5" {
-		t.Fatalf("queued result lost: %v", m)
-	}
-}
-
-func TestApprovalWithNoLinkIsDeniedAtOnce(t *testing.T) {
-	a := newAgent(t, "ws://127.0.0.1:1/ws/agent")
-	a.active = &consultation{7, context.Background()}
-	start(t, a)
-	time.Sleep(20 * time.Millisecond)
-	if r := result(t, ask(a, "req-6", stopNginx)); r.Allow {
-		t.Fatalf("%+v", r)
-	}
-}
-
 func TestNoUndoNeverReachesTheWeb(t *testing.T) {
 	a, b, _ := connected(t)
 	r := result(t, ask(a, "req-7", "systemctl stop nginx"))
@@ -472,7 +369,7 @@ func hookJSON(tool, command, id string) string {
 }
 
 func TestPreHook(t *testing.T) {
-	a, b, c := connected(t)
+	a, b, _ := connected(t)
 	sock := SocketPath(a.cfg.StateDir)
 
 	if code, out, _ := hookRun(t, "pre", hookJSON("Bash", "ps aux", "u1"), sock); code != 0 || out != "" {
@@ -495,76 +392,57 @@ func TestPreHook(t *testing.T) {
 	}
 	b.expect("tool_call")
 
-	// Auto mode may never call the prompt tool, so the hook itself must hold an
-	// approve-tier command until the owner decides.
-	preHookResult := func(id string) <-chan int {
-		done := make(chan int, 1)
-		go func() {
-			code, _, _ := hookRun(t, "pre", hookJSON("Bash", stopNginx, id), sock)
-			done <- code
-		}()
-		return done
+	// Every consultation is auto: no human gate, but the call is on record with its undo.
+	code, out, _ := hookRun(t, "pre", hookJSON("Bash", stopNginx, "u4"), sock)
+	if code != 0 || out != "" {
+		t.Fatalf("approve tier runs without asking: %d %q", code, out)
 	}
-	exit := func(ch <-chan int) int {
-		t.Helper()
-		select {
-		case code := <-ch:
-			return code
-		case <-time.After(5 * time.Second):
-			t.Fatal("hook did not return")
-			return -1
-		}
-	}
-
-	denied := preHookResult("u4")
-	if m := b.expect("tool_call"); m["decision"] != "pending" {
+	m := b.expect("tool_call")
+	if m["decision"] != "auto" || m["tier"] != "approve" || m["undoCommand"] != "sudo -n systemctl start nginx" {
 		t.Fatalf("%v", m)
 	}
-	select {
-	case code := <-denied:
-		t.Fatalf("hook returned %d before any decision", code)
-	case <-time.After(150 * time.Millisecond):
-	}
-	tell(t, c, map[string]string{"type": "decision", "requestId": "u4", "decision": "denied"})
-	if code := exit(denied); code != 2 {
-		t.Fatalf("denied call must block, got %d", code)
-	}
-	b.expect("tool_result")
+}
 
-	approved := preHookResult("u5")
+func TestPromptToolAllowsApproveTier(t *testing.T) {
+	a, _, _ := connected(t)
+	if r := result(t, ask(a, "req-p", stopNginx)); !r.Allow {
+		t.Fatalf("%+v", r)
+	}
+}
+
+func TestCallRefusedWhenUndoCannotBeRecorded(t *testing.T) {
+	a, _, _ := connected(t)
+	a.audit.path = filepath.Join(a.cfg.StateDir, "no-such-dir", "audit.jsonl")
+	code, _, stderr := hookRun(t, "pre", hookJSON("Bash", stopNginx, "u9"), SocketPath(a.cfg.StateDir))
+	if code != 2 || !strings.Contains(stderr, "undo") {
+		t.Fatalf("%d %q", code, stderr)
+	}
+}
+
+func TestUndoRunsOnlyWhatWasRecorded(t *testing.T) {
+	a, b, c := connected(t)
+	var ran atomic.Pointer[string]
+	a.runUndo = func(_ context.Context, command string) int {
+		ran.Store(&command)
+		return 4
+	}
+	if code, _, _ := hookRun(t, "pre", hookJSON("Bash", stopNginx, "req-u"), SocketPath(a.cfg.StateDir)); code != 0 {
+		t.Fatal(code)
+	}
 	b.expect("tool_call")
-	tell(t, c, map[string]string{"type": "decision", "requestId": "u5", "decision": "approved"})
-	if code := exit(approved); code != 0 {
-		t.Fatalf("approved call must pass, got %d", code)
-	}
 
-	// The prompt tool that may follow does not ask twice, but the grant is single use.
-	if r := result(t, ask(a, "u5", stopNginx)); !r.Allow {
-		t.Fatalf("%+v", r)
+	tell(t, c, map[string]any{"type": "undo", "toolCallId": 11, "command": "sudo -n systemctl start nginx"})
+	if m := b.expect("undo_result"); m["toolCallId"] != float64(11) || m["exitCode"] != float64(4) {
+		t.Fatalf("%v", m)
 	}
-	second := ask(a, "u6", stopNginx)
-	if m := b.expect("tool_call"); m["decision"] != "pending" || m["requestId"] != "u6" {
-		t.Fatalf("a grant must not outlive its command: %v", m)
-	}
-	tell(t, c, map[string]string{"type": "decision", "requestId": "u6", "decision": "denied"})
-	if r := result(t, second); r.Allow {
-		t.Fatalf("%+v", r)
-	}
-
-	// Approving once never carries over to a later run of the same command.
-	again := preHookResult("u7")
-	if m := b.expect("tool_call"); m["decision"] != "pending" {
-		t.Fatalf("every run must ask: %v", m)
-	}
-	tell(t, c, map[string]string{"type": "decision", "requestId": "u7", "decision": "denied"})
-	if code := exit(again); code != 2 {
-		t.Fatalf("got %d", code)
+	if got := ran.Load(); got == nil || *got != "sudo -n systemctl start nginx" {
+		t.Fatalf("%v", got)
 	}
 }
 
 func TestClaudeArgsForceAutoModeAndModel(t *testing.T) {
 	args := strings.Join(claudeArgs("claude-opus-5-5", 5, "/bin/gs", "/tmp/s"), " ")
-	for _, want := range []string{"--permission-mode auto", "--model claude-opus-5-5", `"timeout":660`, "--permission-prompt-tool"} {
+	for _, want := range []string{"--permission-mode auto", "--model claude-opus-5-5", "--permission-prompt-tool"} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("missing %q in %s", want, args)
 		}
@@ -708,40 +586,6 @@ func TestMCPDeniesWhenAgentIsGone(t *testing.T) {
 	}
 }
 
-func TestMCPApprovalRoundTrip(t *testing.T) {
-	a, b, c := connected(t)
-	done := make(chan []map[string]any, 1)
-	go func() { done <- mcpExchange(t, SocketPath(a.cfg.StateDir), mcpCall("Bash", stopNginx)) }()
-	if m := b.expect("tool_call"); m["requestId"] != "m1" {
-		t.Fatalf("%v", m)
-	}
-	tell(t, c, map[string]string{"type": "decision", "requestId": "m1", "decision": "denied"})
-	if d := mcpDecision(t, (<-done)[0]); d["behavior"] != "deny" {
-		t.Fatalf("%v", d)
-	}
-}
-
-func TestUndoRunsOnlyWhatWasApproved(t *testing.T) {
-	a, b, c := connected(t)
-	var ran atomic.Pointer[string]
-	a.runUndo = func(_ context.Context, command string) int {
-		ran.Store(&command)
-		return 4
-	}
-	ch := ask(a, "req-u", stopNginx)
-	b.expect("tool_call")
-	tell(t, c, map[string]string{"type": "decision", "requestId": "req-u", "decision": "approved"})
-	result(t, ch)
-
-	tell(t, c, map[string]any{"type": "undo", "toolCallId": 11, "command": "sudo -n systemctl start nginx"})
-	if m := b.expect("undo_result"); m["toolCallId"] != float64(11) || m["exitCode"] != float64(4) {
-		t.Fatalf("%v", m)
-	}
-	if got := ran.Load(); got == nil || *got != "sudo -n systemctl start nginx" {
-		t.Fatalf("%v", got)
-	}
-}
-
 // The backend is not trusted to choose what runs on the server.
 func TestUndoRefusesWhatWasNotRecorded(t *testing.T) {
 	a, b, c := connected(t)
@@ -749,14 +593,15 @@ func TestUndoRefusesWhatWasNotRecorded(t *testing.T) {
 		t.Error("refused undo was executed")
 		return 0
 	}
-	denied := ask(a, "req-d", stopNginx)
+	blocked := "rm -rf /srv # undo: sudo -n systemctl start nginx"
+	if code, _, _ := hookRun(t, "pre", hookJSON("Bash", blocked, "req-d"), SocketPath(a.cfg.StateDir)); code != 2 {
+		t.Fatal(code)
+	}
 	b.expect("tool_call")
-	tell(t, c, map[string]string{"type": "decision", "requestId": "req-d", "decision": "denied"})
-	result(t, denied)
 
 	for i, command := range []string{
 		"touch /tmp/anything",           // never recorded
-		"sudo -n systemctl start nginx", // recorded, but its action was denied
+		"sudo -n systemctl start nginx", // only attached to a blocked call
 		"rm -rf /",                      // deny tier
 		"",                              // empty
 	} {
@@ -779,17 +624,6 @@ func TestUndoLedgerSurvivesRestart(t *testing.T) {
 	}
 	if info, _ := os.Stat(l.path); info.Mode().Perm() != 0o600 {
 		t.Fatalf("audit log mode %o", info.Mode().Perm())
-	}
-}
-
-func TestApprovalDeniedWhenUndoCannotBeRecorded(t *testing.T) {
-	a, b, c := connected(t)
-	a.audit.path = filepath.Join(a.cfg.StateDir, "no-such-dir", "audit.jsonl")
-	ch := ask(a, "req-a", stopNginx)
-	b.expect("tool_call")
-	tell(t, c, map[string]string{"type": "decision", "requestId": "req-a", "decision": "approved"})
-	if r := result(t, ch); r.Allow {
-		t.Fatalf("%+v", r)
 	}
 }
 
@@ -855,15 +689,6 @@ func TestChildEnv(t *testing.T) {
 	}
 	key := childEnv(env, "api_key")
 	if !has(key, "ANTHROPIC_API_KEY") || has(key, "GREENSERVER_TOKEN") {
-		t.Fatalf("%v", key)
-	}
-	count := 0
-	for _, kv := range key {
-		if strings.HasPrefix(kv, "MCP_TOOL_TIMEOUT=") {
-			count++
-		}
-	}
-	if count != 1 {
 		t.Fatalf("%v", key)
 	}
 }
@@ -1012,9 +837,6 @@ func TestConsultationEndToEnd(t *testing.T) {
 	env := read(t, filepath.Join(dir, "env"))
 	if strings.Contains(env, "must-not-leak") {
 		t.Fatalf("secret reached claude:\n%s", env)
-	}
-	if !strings.Contains(env, "MCP_TOOL_TIMEOUT="+mcpToolTimeoutMS) {
-		t.Fatal("MCP call would time out before the approval window")
 	}
 
 	prompt := read(t, filepath.Join(dir, "prompt"))

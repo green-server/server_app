@@ -6,10 +6,10 @@ Green Server의 서버용 앱(에이전트). 사용자 서버에 설치되어 �
 - 연결은 서버에서 백엔드 방향의 WebSocket만 쓴다. 포트를 열지 않는다.
 - 전력은 베어메탈과 집 PC에서 RAPL과 `nvidia-smi`로 실측하고, 클라우드 VM은 CPU 사용률 × 인스턴스 전력 프로필로 추정한다. 추정값은 `is_estimated`로 표시한다.
 - Claude 로그인 정보나 API 키를 저장, 중계하지 않는다.
-- 권한은 자동 허용, 웹 승인, 항상 금지의 3단계다. 방어 구조를 한 겹이라도 빼지 않는다.
+- 컨설팅은 항상 auto mode로 실행하고 사람의 승인을 받지 않는다. 명령은 자동 허용, 조치, 항상 금지로 나눈다. 방어 구조를 한 겹이라도 빼지 않는다.
   1. `--allowedTools`, `--disallowedTools`
   2. PreToolUse 훅 검사
-  3. `--permission-prompt-tool`로 승인 요청을 웹에 중계
+  3. `--permission-mode auto`
   4. 전용 계정 `greenserver` + sudoers 화이트리스트
   5. PostToolUse 훅으로 모든 명령어 기록
 - 모든 조치에는 되돌리는 명령어를 함께 기록한다.
