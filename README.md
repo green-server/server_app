@@ -85,3 +85,12 @@ GOOS=linux GOARCH=amd64 go build ./...
 ```
 
 테스트는 가짜 WebSocket 서버와 PATH의 가짜 `claude` 스크립트로 돌아갑니다. 실제 `claude -p`나 분류 대상 명령을 실행하지 않습니다. macOS에서도 빌드되고 추정 모드로 동작합니다.
+
+## 데모 서버
+
+`cmd/demoagent`는 서버가 여러 대인 상황을 보여 주기 위한 시뮬레이터다. 시나리오별로 에이전트처럼 접속해 만든 값을 보내고, 모든 값은 `추정`으로 표시된다. 어떤 기기에서도 명령을 실행하지 않으며 컨설팅은 `[데모]`로 표시된 고정 결과를 돌려준다. 실제 에이전트에는 포함되지 않는다.
+
+```sh
+DEMO_URL=wss://example.com/ws/agent DEMO_SERVERS="web=토큰,game=토큰,batch=토큰" demoagent
+```
+
