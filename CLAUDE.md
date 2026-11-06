@@ -1,6 +1,6 @@
 # server_app
 
-WattLens의 서버용 앱(에이전트). 사용자 서버에 설치되어 지표를 수집하고, Claude Code(`claude -p`)를 실행해 진단과 조치를 맡긴다.
+Green Server의 서버용 앱(에이전트). 사용자 서버에 설치되어 지표를 수집하고, Claude Code(`claude -p`)를 실행해 진단과 조치를 맡긴다.
 
 - 스택: Go 단일 바이너리
 - 연결은 서버에서 백엔드 방향의 WebSocket만 쓴다. 포트를 열지 않는다.
@@ -10,7 +10,7 @@ WattLens의 서버용 앱(에이전트). 사용자 서버에 설치되어 지표
   1. `--allowedTools`, `--disallowedTools`
   2. PreToolUse 훅 검사
   3. `--permission-prompt-tool`로 승인 요청을 웹에 중계
-  4. 전용 계정 `wattlens` + sudoers 화이트리스트
+  4. 전용 계정 `greenserver` + sudoers 화이트리스트
   5. PostToolUse 훅으로 모든 명령어 기록
 - 모든 조치에는 되돌리는 명령어를 함께 기록한다.
 - 기획과 컨설팅 가이드라인: `green-server/plan`의 `README.md`

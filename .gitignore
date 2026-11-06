@@ -1,0 +1,6 @@
+/greenserver
+/dist/
+*.test
+*.out
+.DS_Store
+.greenserver/
