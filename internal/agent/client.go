@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/green-server/server_app/internal/classify"
+	"github.com/green-server/server_app/internal/priv"
 )
 
 // Everything here runs in short-lived processes started by Claude Code.
@@ -207,4 +209,16 @@ func approveCall(params json.RawMessage, socket string) string {
 		return deny("cannot encode approval")
 	}
 	return string(data)
+}
+
+// TakeGrant fetches the signed permission for one command from the agent.
+func TakeGrant(socket, command string) (*priv.Grant, error) {
+	resp, err := call(socket, ipcRequest{Kind: kindGrant, Command: command})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Grant == nil {
+		return nil, errors.New(resp.Message)
+	}
+	return resp.Grant, nil
 }

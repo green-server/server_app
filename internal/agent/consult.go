@@ -23,6 +23,13 @@ const (
 	consultTimeout = 2 * time.Hour
 
 	maxTaskBytes = 16 * 1024
+
+	// The pre hook waits for the owner on privileged commands, so it has to
+	// outlast the 10 minute window, and so does the MCP call that can follow.
+	hookTimeoutSeconds = 660
+	mcpToolTimeoutMS   = "660000"
+
+	socketEnv = "GREENSERVER_SOCKET" // how `greenserver priv` finds the agent
 )
 
 // Bash and Read are the only built-in tools Claude gets. Edit and Write are
@@ -128,7 +135,7 @@ func (a *Agent) invokeClaude(ctx context.Context, m incoming) (*consultResult, e
 	}
 	cmd := exec.CommandContext(ctx, bin, claudeArgs(m.Model, m.MaxTurns, exe, SocketPath(a.cfg.StateDir))...)
 	cmd.Dir = work
-	cmd.Env = childEnv(os.Environ(), m.AuthMode)
+	cmd.Env = append(childEnv(os.Environ(), m.AuthMode), socketEnv+"="+SocketPath(a.cfg.StateDir))
 	cmd.Stdin = strings.NewReader(buildPrompt(a.cfg.StateDir, m.Task))
 	cmd.Stderr = os.Stderr
 	// Own process group, so a timeout also ends whatever Claude started.
@@ -153,7 +160,9 @@ func (a *Agent) invokeClaude(ctx context.Context, m incoming) (*consultResult, e
 func claudeArgs(model string, maxTurns int, exe, socket string) []string {
 	hook := func(kind string) []map[string]any {
 		command := fmt.Sprintf("%s hook %s --socket %s", shellQuote(exe), kind, shellQuote(socket))
-		return []map[string]any{{"matcher": "*", "hooks": []map[string]string{{"type": "command", "command": command}}}}
+		return []map[string]any{{"matcher": "*", "hooks": []map[string]any{
+			{"type": "command", "command": command, "timeout": hookTimeoutSeconds},
+		}}}
 	}
 	settings := mustJSON(map[string]any{"hooks": map[string]any{
 		"PreToolUse":  hook("pre"),
@@ -198,19 +207,19 @@ func shellQuote(s string) string {
 // never reaches Claude. In subscription mode the API key variables must go,
 // or claude would bill the key instead of using the owner's login.
 func childEnv(environ []string, authMode string) []string {
-	drop := map[string]bool{"GREENSERVER_TOKEN": true}
+	drop := map[string]bool{"GREENSERVER_TOKEN": true, "MCP_TOOL_TIMEOUT": true}
 	if authMode != "api_key" {
 		drop["ANTHROPIC_API_KEY"] = true
 		drop["ANTHROPIC_AUTH_TOKEN"] = true
 	}
-	out := make([]string, 0, len(environ))
+	out := make([]string, 0, len(environ)+1)
 	for _, kv := range environ {
 		name, _, _ := strings.Cut(kv, "=")
 		if !drop[name] {
 			out = append(out, kv)
 		}
 	}
-	return out
+	return append(out, "MCP_TOOL_TIMEOUT="+mcpToolTimeoutMS)
 }
 
 func buildPrompt(stateDir, task string) string {
@@ -258,8 +267,23 @@ const promptTemplate = `당신은 이 서버 안에서 실행 중인 Green Serve
 
 - 쉘 변수와 명령 치환 대신 값을 직접 쓰세요. 값을 정적으로 확인할 수 없는 명령은 거부됩니다.
 - 비밀 파일, rm -rf, dd, 파이프로 쉘 실행, SSH와 방화벽 변경은 항상 금지이며 우회를 시도하지 마세요.
-- sudo는 비밀번호 없이 허용된 명령만 됩니다. sudo -l로 확인하세요.
+- sudo는 쓸 수 없습니다. root 권한이 필요하면 아래 권한 요청을 쓰세요.
 - 거부되면 같은 명령을 다시 시도하지 말고 다른 방법을 찾거나 보고서에 남기세요.
+
+## 권한 요청
+
+root 권한이 필요한 작업은 greenserver priv로 요청합니다. 서버 주인이 브라우저에서 허용해야 실행되고, 거부되면 그 명령은 다시 요청하지 마세요.
+
+    greenserver priv docker restart minecraft-server # undo: greenserver priv docker start minecraft-server
+
+아래 형식만 가능합니다. 다른 형식은 허용을 받아도 실행되지 않습니다.
+
+- greenserver priv docker stop|start|restart 컨테이너이름
+- greenserver priv systemctl stop|start|restart 서비스이름
+- greenserver priv cpupower frequency-set -g powersave|schedutil|ondemand|conservative|performance
+- greenserver priv powerprofilesctl set power-saver|balanced|performance
+
+SSH, 터널, Docker 자체, Dokploy, Green Server 구성 요소는 보호되어 있어 건드릴 수 없습니다. 요청 전에 접속자가 없는지 확인하세요.
 
 ## 최종 응답
 

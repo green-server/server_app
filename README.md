@@ -14,7 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/green-server/server_app/main/instal
 | 옵션 | 설명 |
 |---|---|
 | `--server URL` | 백엔드 주소. 필수 |
-| `--services a,b` | AI가 승인 없이 중지, 시작, 재시작할 수 있는 서비스. 생략하면 없음 |
+| `--services a,b` | AI가 승인 없이 sudo로 중지, 시작, 재시작할 수 있는 서비스. 생략하면 없음 |
+| `--grant-key KEY`, `--server-id N` | 브라우저에서 허용한 root 명령을 실행하는 root 도우미를 설치. KEY는 `GET /api/grant-public-key` 값 |
 | `--idle-watts N`, `--max-watts N` | RAPL이 없을 때 쓰는 전력 프로필 |
 | `--binary PATH` | 릴리스를 내려받지 않고 이 파일을 설치 |
 

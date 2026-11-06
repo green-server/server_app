@@ -442,7 +442,7 @@ func TestUndoRunsOnlyWhatWasRecorded(t *testing.T) {
 
 func TestClaudeArgsForceAutoModeAndModel(t *testing.T) {
 	args := strings.Join(claudeArgs("claude-opus-5-5", 5, "/bin/gs", "/tmp/s"), " ")
-	for _, want := range []string{"--permission-mode auto", "--model claude-opus-5-5", "--permission-prompt-tool"} {
+	for _, want := range []string{"--permission-mode auto", "--model claude-opus-5-5", "--permission-prompt-tool", `"timeout":660`} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("missing %q in %s", want, args)
 		}
@@ -664,7 +664,7 @@ func TestPromptExamplesPassTheClassifier(t *testing.T) {
 			t.Errorf("%q: %+v", line, v)
 		}
 	}
-	if found != 2 {
+	if found != 3 {
 		t.Fatalf("found %d examples", found)
 	}
 	read, _ := json.Marshal(map[string]string{"file_path": latestPath("/var/lib/greenserver/state")})
@@ -936,5 +936,107 @@ func TestOversizedTaskRefused(t *testing.T) {
 	tell(t, c, map[string]any{"type": "consultation_start", "consultationId": 1, "authMode": "api_key", "model": "claude-sonnet-5-5", "maxTurns": 5, "task": strings.Repeat("a", maxTaskBytes+1)})
 	if m := b.expect("consultation_status"); m["status"] != "failed" {
 		t.Fatalf("%v", m)
+	}
+}
+
+const privRestart = "greenserver priv docker restart minecraft-server"
+
+func TestPrivilegedCommandWaitsForTheBrowser(t *testing.T) {
+	a, b, c := connected(t)
+	sock := SocketPath(a.cfg.StateDir)
+	withUndo := privRestart + " # undo: greenserver priv docker start minecraft-server"
+	run := func(id string) <-chan int {
+		done := make(chan int, 1)
+		go func() {
+			code, _, _ := hookRun(t, "pre", hookJSON("Bash", withUndo, id), sock)
+			done <- code
+		}()
+		return done
+	}
+	exit := func(ch <-chan int) int {
+		t.Helper()
+		select {
+		case code := <-ch:
+			return code
+		case <-time.After(5 * time.Second):
+			t.Fatal("hook did not return")
+			return -1
+		}
+	}
+	if _, err := TakeGrant(sock, privRestart); err == nil {
+		t.Fatal("a grant exists before anyone allowed it")
+	}
+
+	denied := run("p1")
+	if m := b.expect("tool_call"); m["decision"] != "pending" || m["command"] != privRestart {
+		t.Fatalf("%v", m)
+	}
+	select {
+	case code := <-denied:
+		t.Fatalf("hook returned %d before any decision", code)
+	case <-time.After(150 * time.Millisecond):
+	}
+	// A forged grant on a refusal must not stick.
+	tell(t, c, map[string]any{"type": "decision", "requestId": "p1", "decision": "denied", "grant": map[string]any{"expires": 9, "nonce": "x", "signature": "y"}})
+	if code := exit(denied); code != 2 {
+		t.Fatalf("got %d", code)
+	}
+	b.expect("tool_result")
+	if _, err := TakeGrant(sock, privRestart); err == nil {
+		t.Fatal("denied call left a grant")
+	}
+
+	allowed := run("p2")
+	b.expect("tool_call")
+	tell(t, c, map[string]any{"type": "decision", "requestId": "p2", "decision": "approved", "grant": map[string]any{"expires": 9, "nonce": "n", "signature": "s"}})
+	if code := exit(allowed); code != 0 {
+		t.Fatalf("got %d", code)
+	}
+	if _, err := TakeGrant(sock, "greenserver priv docker stop minecraft-server"); err == nil {
+		t.Fatal("a grant covered another command")
+	}
+	g, err := TakeGrant(sock, privRestart)
+	if err != nil || g.Nonce != "n" {
+		t.Fatalf("%+v %v", g, err)
+	}
+	if _, err := TakeGrant(sock, privRestart); err == nil {
+		t.Fatal("a grant must be handed out once")
+	}
+}
+
+func TestPrivilegedCommandOffTheListNeverReachesTheBrowser(t *testing.T) {
+	a, b, _ := connected(t)
+	sock := SocketPath(a.cfg.StateDir)
+	for _, command := range []string{
+		"greenserver priv docker exec x sh # undo: greenserver priv docker start x",
+		"greenserver priv docker stop dokploy # undo: greenserver priv docker start dokploy",
+		"greenserver priv docker stop x; id # undo: greenserver priv docker start x",
+	} {
+		code, _, _ := hookRun(t, "pre", hookJSON("Bash", command, "x"), sock)
+		if code != 2 {
+			t.Fatalf("%q: %d", command, code)
+		}
+		if m := b.expect("tool_call"); m["decision"] != "blocked" {
+			t.Fatalf("%q: %v", command, m)
+		}
+	}
+}
+
+func TestLinkDropDeniesAPendingPermission(t *testing.T) {
+	a, b, c := connected(t)
+	done := make(chan int, 1)
+	go func() {
+		code, _, _ := hookRun(t, "pre", hookJSON("Bash", privRestart+" # undo: greenserver priv docker start minecraft-server", "p3"), SocketPath(a.cfg.StateDir))
+		done <- code
+	}()
+	b.expect("tool_call")
+	c.Close(websocket.StatusNormalClosure, "")
+	select {
+	case code := <-done:
+		if code != 2 {
+			t.Fatalf("got %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hook did not return")
 	}
 }

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"github.com/green-server/server_app/internal/priv"
 
 	"github.com/green-server/server_app/internal/classify"
 	"github.com/green-server/server_app/internal/metrics"
@@ -69,20 +70,24 @@ type undoResultMsg struct {
 
 // incoming is the union of backend-to-agent messages.
 type incoming struct {
-	Type             string `json:"type"`
-	ConsultationID   int64  `json:"consultationId"`
-	AuthMode         string `json:"authMode"`
-	MaxTurns         int    `json:"maxTurns"`
-	Model            string `json:"model"`
-	RecommendationID int64  `json:"recommendationId"`
-	Task             string `json:"task"`
-	ToolCallID       int64  `json:"toolCallId"`
-	Command          string `json:"command"`
+	Type             string      `json:"type"`
+	ConsultationID   int64       `json:"consultationId"`
+	AuthMode         string      `json:"authMode"`
+	MaxTurns         int         `json:"maxTurns"`
+	Model            string      `json:"model"`
+	RecommendationID int64       `json:"recommendationId"`
+	RequestID        string      `json:"requestId"`
+	Decision         string      `json:"decision"`
+	Grant            *priv.Grant `json:"grant"`
+	Task             string      `json:"task"`
+	ToolCallID       int64       `json:"toolCallId"`
+	Command          string      `json:"command"`
 }
 
 // Local socket protocol: one JSON request line, one JSON response line.
 
 const (
+	kindGrant   = "grant"
 	kindPre     = "pre"
 	kindPost    = "post"
 	kindApprove = "approve"
@@ -94,9 +99,11 @@ type ipcRequest struct {
 	Input     json.RawMessage `json:"input"`
 	ToolUseID string          `json:"toolUseId"`
 	ExitCode  *int            `json:"exitCode,omitempty"`
+	Command   string          `json:"command,omitempty"`
 }
 
 type ipcResponse struct {
-	Allow   bool   `json:"allow"`
-	Message string `json:"message"`
+	Allow   bool        `json:"allow"`
+	Message string      `json:"message"`
+	Grant   *priv.Grant `json:"grant,omitempty"`
 }

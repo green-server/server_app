@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/green-server/server_app/internal/agent"
 	"github.com/green-server/server_app/internal/metrics"
+	"github.com/green-server/server_app/internal/priv"
 )
 
 var version = "dev" // set with -ldflags "-X main.version=..."
@@ -21,6 +23,8 @@ const usage = `usage:
   greenserver run --server wss://host/ws/agent [--token T] [--idle-watts W] [--max-watts W] [--state-dir DIR]
   greenserver hook pre|post [--socket PATH]
   greenserver mcp-approve [--socket PATH]
+  greenserver priv docker|systemctl|cpupower|powerprofilesctl ...
+  greenserver root-helper --public-key KEY --server-id N [--socket PATH] [--group NAME]
   greenserver version
 
 The token can also come from GREENSERVER_TOKEN, which keeps it out of ps output.
@@ -44,11 +48,59 @@ func main() {
 		if err := agent.ServeMCP(os.Stdin, os.Stdout, *socket); err != nil {
 			log.Fatal(err)
 		}
+	case "priv":
+		privileged(args)
+	case "root-helper":
+		rootHelper(args)
 	case "version":
 		fmt.Println(version)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
+	}
+}
+
+// privileged runs one command through the root helper. It needs the grant the
+// owner's browser approval produced, so running it by hand does nothing.
+func privileged(args []string) {
+	command := priv.Prefix + strings.Join(args, " ")
+	if _, err := priv.Parse(command); err != nil {
+		log.Fatal(err)
+	}
+	socket := os.Getenv("GREENSERVER_SOCKET")
+	if socket == "" {
+		socket = defaultSocket()
+	}
+	grant, err := agent.TakeGrant(socket, command)
+	if err != nil {
+		log.Fatal(err)
+	}
+	resp, err := priv.Call(priv.DefaultSocket, priv.Request{Command: command, Grant: *grant})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if resp.Error != "" {
+		fmt.Fprintln(os.Stderr, "greenserver:", resp.Error)
+	}
+	fmt.Print(resp.Output)
+	os.Exit(resp.ExitCode)
+}
+
+func rootHelper(args []string) {
+	fs := flag.NewFlagSet("root-helper", flag.ExitOnError)
+	key := fs.String("public-key", "", "backend grant public key, base64")
+	server := fs.Int64("server-id", 0, "id of this server on the backend")
+	socket := fs.String("socket", priv.DefaultSocket, "socket to listen on")
+	group := fs.String("group", "greenserver", "group allowed to use the socket")
+	fs.Parse(args)
+	h, err := priv.NewHelper(*key, *server)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := h.Serve(ctx, *socket, *group); err != nil {
+		log.Fatal(err)
 	}
 }
 

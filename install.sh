@@ -14,6 +14,7 @@ STATE_DIR="$HOME_DIR/state"
 BIN="/usr/local/bin/greenserver"
 CONF_DIR="/etc/greenserver"
 UNIT="/etc/systemd/system/greenserver.service"
+ROOT_UNIT="/etc/systemd/system/greenserver-root.service"
 SUDOERS="/etc/sudoers.d/greenserver"
 TMPFILES="/etc/tmpfiles.d/greenserver-rapl.conf"
 
@@ -29,6 +30,9 @@ Usage: GREENSERVER_TOKEN=<token> install.sh --server URL [options]
   --idle-watts N      estimated watts at 0% CPU, for hosts without RAPL
   --max-watts N       estimated watts at 100% CPU, for hosts without RAPL
   --binary PATH       install this binary instead of downloading a release
+  --grant-key KEY     backend public key; with --server-id, installs the root
+                      helper so root commands can be allowed from the browser
+  --server-id N       id of this server on the backend
 EOF
 }
 
@@ -43,7 +47,7 @@ valid_service() {
 }
 
 main() {
-  local server="" services="" idle_watts="" max_watts="" binary=""
+  local server="" services="" idle_watts="" max_watts="" binary="" grant_key="" server_id=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --server)     server="${2:?}"; shift 2 ;;
@@ -51,6 +55,8 @@ main() {
       --idle-watts) idle_watts="${2:?}"; shift 2 ;;
       --max-watts)  max_watts="${2:?}"; shift 2 ;;
       --binary)     binary="${2:?}"; shift 2 ;;
+      --grant-key)  grant_key="${2:?}"; shift 2 ;;
+      --server-id)  server_id="${2:?}"; shift 2 ;;
       -h|--help)    usage; exit 0 ;;
       *)            usage >&2; die "unknown option: $1" ;;
     esac
@@ -69,6 +75,10 @@ main() {
     [[ -z $n || $n =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "watts must be a number: $n"
   done
 
+  [[ -z $grant_key || $grant_key =~ ^[A-Za-z0-9+/]{43}=$ ]] || die "--grant-key must be a base64 public key"
+  [[ -z $server_id || $server_id =~ ^[0-9]+$ ]] || die "--server-id must be a number"
+  [[ -z $grant_key && -z $server_id || -n $grant_key && -n $server_id ]] || die "--grant-key and --server-id go together"
+
   local -a service_list=()
   if [[ -n $services ]]; then
     IFS=',' read -r -a service_list <<<"$services"
@@ -85,10 +95,17 @@ main() {
   install_rapl_access
   install_sudoers "${service_list[@]+"${service_list[@]}"}"
   install_unit "$server" "$idle_watts" "$max_watts"
+  if [[ -n $grant_key ]]; then
+    install_root_helper "$grant_key" "$server_id"
+  fi
 
   systemctl daemon-reload
   systemctl enable greenserver.service >/dev/null 2>&1
   systemctl restart greenserver.service
+  if [[ -n $grant_key ]]; then
+    systemctl enable greenserver-root.service >/dev/null 2>&1
+    systemctl restart greenserver-root.service
+  fi
 
   cat <<EOF
 
@@ -228,6 +245,27 @@ RestartSec=5
 UMask=0077
 # NoNewPrivileges and ProtectSystem stay off on purpose: they would break the
 # sudo whitelist and approved config edits for the Claude child process.
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# Runs as root, but only accepts commands the backend signed after the owner
+# allowed them in the browser, and only from a short list. See internal/priv.
+install_root_helper() {
+  cat >"$ROOT_UNIT" <<EOF
+[Unit]
+Description=Green Server root helper
+After=network-online.target docker.service
+
+[Service]
+ExecStart=$BIN root-helper --public-key $1 --server-id $2
+RuntimeDirectory=greenserver-root
+RuntimeDirectoryMode=0750
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

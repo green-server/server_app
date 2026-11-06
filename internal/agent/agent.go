@@ -18,12 +18,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/green-server/server_app/internal/classify"
 	"github.com/green-server/server_app/internal/metrics"
+	"github.com/green-server/server_app/internal/priv"
 )
 
 const (
@@ -63,6 +65,17 @@ type Agent struct {
 	conn   *websocket.Conn
 	queue  [][]byte // reliable messages waiting for a link
 	active *consultation
+
+	approvalWait time.Duration
+	down         chan struct{} // closed when the current link drops
+	pending      map[string]pendingCall
+	grants       map[string]priv.Grant // command -> signed permission, handed out once
+}
+
+// pendingCall waits for the owner to allow a privileged command in the browser.
+type pendingCall struct {
+	decision chan string
+	command  string
 }
 
 func New(cfg Config) (*Agent, error) {
@@ -89,7 +102,12 @@ func New(cfg Config) (*Agent, error) {
 		metricsEvery: 10 * time.Second,
 		backoffBase:  time.Second,
 		backoffMax:   time.Minute,
-		runUndo:      shellUndo,
+		runUndo: func(ctx context.Context, command string) int {
+			return shellUndo(ctx, command, SocketPath(cfg.StateDir))
+		},
+		approvalWait: 10 * time.Minute,
+		pending:      map[string]pendingCall{},
+		grants:       map[string]priv.Grant{},
 	}, nil
 }
 
@@ -224,7 +242,7 @@ func (a *Agent) attach(ctx context.Context, conn *websocket.Conn) error {
 		}
 		a.queue = a.queue[1:]
 	}
-	a.conn = conn
+	a.conn, a.down = conn, make(chan struct{})
 	return nil
 }
 
@@ -232,6 +250,7 @@ func (a *Agent) detach() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.conn = nil
+	close(a.down) // every permission waiting on this link is now denied
 }
 
 func write(ctx context.Context, conn *websocket.Conn, data []byte) error {
@@ -284,7 +303,23 @@ func (a *Agent) handle(ctx context.Context, m incoming) {
 	switch m.Type {
 	case "consultation_start":
 		a.startConsultation(ctx, m)
+	case "decision":
+		a.mu.Lock()
+		p, ok := a.pending[m.RequestID]
+		delete(a.pending, m.RequestID)
+		if ok && m.Decision == "approved" && m.Grant != nil {
+			a.grants[p.command] = *m.Grant
+		}
+		a.mu.Unlock()
+		if ok {
+			p.decision <- m.Decision
+		}
 	case "undo":
+		if m.Grant != nil {
+			a.mu.Lock()
+			a.grants[m.Command] = *m.Grant
+			a.mu.Unlock()
+		}
 		go a.handleUndo(ctx, m.ToolCallID, m.Command)
 	}
 }
@@ -344,11 +379,11 @@ func (a *Agent) handleUndo(ctx context.Context, id int64, command string) {
 	a.sendReliable(undoResultMsg{"undo_result", id, code})
 }
 
-func shellUndo(ctx context.Context, command string) int {
+func shellUndo(ctx context.Context, command, socket string) int {
 	ctx, cancel := context.WithTimeout(ctx, undoTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
-	cmd.Env = childEnv(os.Environ(), "subscription")
+	cmd.Env = append(childEnv(os.Environ(), "subscription"), socketEnv+"="+socket)
 	err := cmd.Run()
 	var exit *exec.ExitError
 	switch {
@@ -408,6 +443,9 @@ func (a *Agent) current() *consultation {
 // dispatch re-evaluates every request itself: the caller's own classification
 // is never trusted, and nothing is allowed outside a running consultation.
 func (a *Agent) dispatch(req ipcRequest) ipcResponse {
+	if req.Kind == kindGrant {
+		return a.takeGrant(req.Command)
+	}
 	c := a.current()
 	if c == nil {
 		return ipcResponse{Message: "no consultation is running"}
@@ -434,6 +472,8 @@ func (a *Agent) preCheck(c *consultation, req ipcRequest, v classify.Verdict) ip
 	case v.Tier == classify.Auto:
 		a.sendReliable(toolCallMsg{"tool_call", c.id, req.ToolUseID, v.Command, v.Tier, "auto", nil})
 		a.logCall(c, req.ToolUseID, v, "auto")
+	case strings.HasPrefix(v.Command, priv.Prefix):
+		return a.requestPermission(c, req, v)
 	default:
 		// Runs without a human: every consultation is auto. Recorded first, because
 		// the audit log is the undo ledger and an action must not run unrecorded.
@@ -443,6 +483,84 @@ func (a *Agent) preCheck(c *consultation, req ipcRequest, v classify.Verdict) ip
 		a.sendReliable(toolCallMsg{"tool_call", c.id, req.ToolUseID, v.Command, v.Tier, "auto", undoPtr(v)})
 	}
 	return ipcResponse{Allow: true}
+}
+
+// requestPermission holds a privileged command until the owner decides in the
+// browser. Everything else in a consultation is auto; this is the one human gate,
+// and the helper enforces it, because only an allowed call comes back signed.
+func (a *Agent) requestPermission(c *consultation, req ipcRequest, v classify.Verdict) ipcResponse {
+	if _, err := priv.Parse(v.Command); err != nil {
+		v.Reason = err.Error()
+		a.reportBlocked(c, req.ToolUseID, v)
+		return ipcResponse{Message: v.Reason}
+	}
+	id := req.ToolUseID
+	decision := a.waitForDecision(c, id, v)
+	if err := a.logCall(c, id, v, decision); err != nil && decision == "approved" {
+		decision = "undo could not be recorded"
+	}
+	if decision != "approved" {
+		a.takeGrant(v.Command)
+		a.sendReliable(toolResultMsg{"tool_result", id, nil})
+		return ipcResponse{Message: "denied: " + decision}
+	}
+	return ipcResponse{Allow: true}
+}
+
+// takeGrant hands a permission to `greenserver priv` once.
+func (a *Agent) takeGrant(command string) ipcResponse {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	g, ok := a.grants[command]
+	if !ok {
+		return ipcResponse{Message: "no permission for this command"}
+	}
+	delete(a.grants, command)
+	return ipcResponse{Allow: true, Grant: &g}
+}
+
+// waitForDecision returns "approved" or why it was not. Only an explicit
+// approved over a live link counts: silence, a dropped link or anything
+// malformed is a denial.
+func (a *Agent) waitForDecision(c *consultation, id string, v classify.Verdict) string {
+	data, err := json.Marshal(toolCallMsg{"tool_call", c.id, id, v.Command, v.Tier, "pending", undoPtr(v)})
+	if err != nil {
+		return "unencodable request"
+	}
+	ch := make(chan string, 1)
+	a.mu.Lock()
+	if _, dup := a.pending[id]; dup {
+		a.mu.Unlock()
+		return "duplicate request"
+	}
+	if !a.writeLocked(data) {
+		a.mu.Unlock()
+		return "backend link is down"
+	}
+	a.pending[id] = pendingCall{ch, v.Command}
+	down := a.down
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.pending, id)
+		a.mu.Unlock()
+	}()
+
+	timer := time.NewTimer(a.approvalWait)
+	defer timer.Stop()
+	select {
+	case d := <-ch:
+		if d == "approved" {
+			return d
+		}
+		return "denied by the owner"
+	case <-timer.C:
+		return "approval timed out"
+	case <-down:
+		return "backend link dropped"
+	case <-c.ctx.Done():
+		return "consultation ended"
+	}
 }
 
 // approve answers the prompt tool. The pre hook already recorded the call, so
