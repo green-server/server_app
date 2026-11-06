@@ -46,8 +46,9 @@ type Config struct {
 func SocketPath(stateDir string) string { return filepath.Join(stateDir, "agent.sock") }
 
 type consultation struct {
-	id  int64
-	ctx context.Context
+	id       int64
+	ctx      context.Context
+	readOnly bool
 }
 
 type Agent struct {
@@ -455,6 +456,10 @@ func (a *Agent) dispatch(req ipcRequest) ipcResponse {
 		return ipcResponse{Allow: true}
 	}
 	v := classify.Evaluate(req.Tool, req.Input)
+	// A plan must not touch the server, whatever the model decides to try.
+	if c.readOnly && !v.Blocked && v.Tier != classify.Auto {
+		v.Blocked, v.Reason = true, "계획 단계에서는 읽기 명령만 실행할 수 있습니다"
+	}
 	switch req.Kind {
 	case kindPre:
 		return a.preCheck(c, req, v)

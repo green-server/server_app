@@ -89,6 +89,7 @@ type incoming struct {
 	Decision         string      `json:"decision"`
 	Grant            *priv.Grant `json:"grant"`
 	Task             string      `json:"task"`
+	ReadOnly         bool        `json:"readOnly"`
 	ToolCallID       int64       `json:"toolCallId"`
 	Command          string      `json:"command"`
 }
