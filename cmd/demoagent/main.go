@@ -106,6 +106,22 @@ var scenarios = map[string]scenario{
 	},
 }
 
+// variant is a scenario running on another schedule and at another size, so a
+// fleet does not peak in lockstep.
+func variant(base string, name string, shift time.Duration, idle, max float64) scenario {
+	s := scenarios[base]
+	load := s.Load
+	s.Name, s.Idle, s.Max = name, idle, max
+	s.Load = func(t time.Time) float64 { return load(t.Add(-shift)) }
+	return s
+}
+
+func init() {
+	scenarios["api"] = variant("web", "api", 3*time.Hour, 34, 88)
+	scenarios["game2"] = variant("game", "game2", -4*time.Hour, 64, 142)
+	scenarios["encode"] = variant("batch", "encode", 80*time.Minute, 52, 268)
+}
+
 func noise(name string, t time.Time) float64 {
 	h := fnv.New32a()
 	h.Write([]byte(name + t.UTC().Format(time.RFC3339)))
@@ -193,7 +209,7 @@ func run(ctx context.Context, url, token string, s scenario) error {
 		// time.Now each round: the catch-up takes minutes, and those must not leave a gap.
 		for t := time.Now().Truncate(step).Add(-backfill); t.Before(time.Now().Truncate(step)) && ctx.Err() == nil; t = t.Add(step) {
 			_ = send(metrics(s, t, false))
-			time.Sleep(25 * time.Millisecond) // the database also serves real traffic
+			time.Sleep(50 * time.Millisecond) // the database also serves real traffic
 		}
 		ticker := time.NewTicker(step)
 		defer ticker.Stop()
