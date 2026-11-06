@@ -472,7 +472,7 @@ func hookJSON(tool, command, id string) string {
 }
 
 func TestPreHook(t *testing.T) {
-	a, b, _ := connected(t)
+	a, b, c := connected(t)
 	sock := SocketPath(a.cfg.StateDir)
 
 	if code, out, _ := hookRun(t, "pre", hookJSON("Bash", "ps aux", "u1"), sock); code != 0 || out != "" {
@@ -495,9 +495,90 @@ func TestPreHook(t *testing.T) {
 	}
 	b.expect("tool_call")
 
-	code, out, _ := hookRun(t, "pre", hookJSON("Bash", stopNginx, "u4"), sock)
-	if code != 0 || !strings.Contains(out, `"permissionDecision":"ask"`) || !strings.Contains(out, `"hookEventName":"PreToolUse"`) {
-		t.Fatalf("approve must force the prompt tool: %d %q", code, out)
+	// Auto mode may never call the prompt tool, so the hook itself must hold an
+	// approve-tier command until the owner decides.
+	preHookResult := func(id string) <-chan int {
+		done := make(chan int, 1)
+		go func() {
+			code, _, _ := hookRun(t, "pre", hookJSON("Bash", stopNginx, id), sock)
+			done <- code
+		}()
+		return done
+	}
+	exit := func(ch <-chan int) int {
+		t.Helper()
+		select {
+		case code := <-ch:
+			return code
+		case <-time.After(5 * time.Second):
+			t.Fatal("hook did not return")
+			return -1
+		}
+	}
+
+	denied := preHookResult("u4")
+	if m := b.expect("tool_call"); m["decision"] != "pending" {
+		t.Fatalf("%v", m)
+	}
+	select {
+	case code := <-denied:
+		t.Fatalf("hook returned %d before any decision", code)
+	case <-time.After(150 * time.Millisecond):
+	}
+	tell(t, c, map[string]string{"type": "decision", "requestId": "u4", "decision": "denied"})
+	if code := exit(denied); code != 2 {
+		t.Fatalf("denied call must block, got %d", code)
+	}
+	b.expect("tool_result")
+
+	approved := preHookResult("u5")
+	b.expect("tool_call")
+	tell(t, c, map[string]string{"type": "decision", "requestId": "u5", "decision": "approved"})
+	if code := exit(approved); code != 0 {
+		t.Fatalf("approved call must pass, got %d", code)
+	}
+
+	// The prompt tool that may follow does not ask twice, but the grant is single use.
+	if r := result(t, ask(a, "u5", stopNginx)); !r.Allow {
+		t.Fatalf("%+v", r)
+	}
+	second := ask(a, "u6", stopNginx)
+	if m := b.expect("tool_call"); m["decision"] != "pending" || m["requestId"] != "u6" {
+		t.Fatalf("a grant must not outlive its command: %v", m)
+	}
+	tell(t, c, map[string]string{"type": "decision", "requestId": "u6", "decision": "denied"})
+	if r := result(t, second); r.Allow {
+		t.Fatalf("%+v", r)
+	}
+
+	// Approving once never carries over to a later run of the same command.
+	again := preHookResult("u7")
+	if m := b.expect("tool_call"); m["decision"] != "pending" {
+		t.Fatalf("every run must ask: %v", m)
+	}
+	tell(t, c, map[string]string{"type": "decision", "requestId": "u7", "decision": "denied"})
+	if code := exit(again); code != 2 {
+		t.Fatalf("got %d", code)
+	}
+}
+
+func TestClaudeArgsForceAutoModeAndModel(t *testing.T) {
+	args := strings.Join(claudeArgs("claude-opus-5-5", 5, "/bin/gs", "/tmp/s"), " ")
+	for _, want := range []string{"--permission-mode auto", "--model claude-opus-5-5", `"timeout":660`, "--permission-prompt-tool"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("missing %q in %s", want, args)
+		}
+	}
+}
+
+func TestUnknownModelRefused(t *testing.T) {
+	b := newBackend(t)
+	start(t, newAgent(t, b.url))
+	c := b.conn()
+	b.expect("hello")
+	tell(t, c, map[string]any{"type": "consultation_start", "consultationId": 1, "authMode": "api_key", "model": "--dangerously-skip-permissions", "maxTurns": 5})
+	if m := b.expect("consultation_status"); m["status"] != "failed" {
+		t.Fatalf("%v", m)
 	}
 }
 
@@ -860,7 +941,7 @@ func consult(t *testing.T, stream string, exit int, authMode string) (*fakeBacke
 	start(t, newAgent(t, b.url))
 	c := b.conn()
 	b.expect("hello")
-	tell(t, c, map[string]any{"type": "consultation_start", "consultationId": 42, "authMode": authMode, "maxTurns": 15})
+	tell(t, c, map[string]any{"type": "consultation_start", "consultationId": 42, "authMode": authMode, "model": "claude-sonnet-5-5", "maxTurns": 15})
 	if m := b.expect("consultation_status"); m["status"] != "running" || m["consultationId"] != float64(42) {
 		t.Fatalf("%v", m)
 	}
@@ -977,8 +1058,8 @@ func TestConsultationValidation(t *testing.T) {
 	c := b.conn()
 	b.expect("hello")
 	for _, bad := range []map[string]any{
-		{"type": "consultation_start", "consultationId": 1, "authMode": "stolen", "maxTurns": 5},
-		{"type": "consultation_start", "consultationId": 2, "authMode": "api_key", "maxTurns": 0},
+		{"type": "consultation_start", "consultationId": 1, "authMode": "stolen", "model": "claude-sonnet-5-5", "maxTurns": 5},
+		{"type": "consultation_start", "consultationId": 2, "authMode": "api_key", "model": "claude-sonnet-5-5", "maxTurns": 0},
 	} {
 		tell(t, c, bad)
 		if m := b.expect("consultation_status"); m["status"] != "failed" {
@@ -989,11 +1070,26 @@ func TestConsultationValidation(t *testing.T) {
 
 func TestOnlyOneConsultationAtATime(t *testing.T) {
 	a, b, c := connected(t) // already has consultation 7 open
-	tell(t, c, map[string]any{"type": "consultation_start", "consultationId": 8, "authMode": "api_key", "maxTurns": 5})
+	tell(t, c, map[string]any{"type": "consultation_start", "consultationId": 8, "authMode": "api_key", "model": "claude-sonnet-5-5", "maxTurns": 5})
 	if m := b.expect("consultation_status"); m["status"] != "failed" || m["consultationId"] != float64(8) {
 		t.Fatalf("%v", m)
 	}
 	if a.current().id != 7 {
 		t.Fatal("running consultation was replaced")
+	}
+}
+
+func TestParseStreamLevel(t *testing.T) {
+	line := func(level string) string {
+		final, _ := json.Marshal(map[string]any{"level": level, "summary": "요약", "feedback": []string{"a"}, "fixes": []string{"b"}})
+		ev, _ := json.Marshal(map[string]any{"type": "result", "subtype": "success", "result": string(final)})
+		return string(ev) + "\n"
+	}
+	res, err := parseStream(strings.NewReader(line("critical")))
+	if err != nil || res.Level != "critical" || res.Feedback[0] != "a" || res.Fixes[0] != "b" {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if res, err = parseStream(strings.NewReader(line("panic"))); err != nil || res.Level != "" {
+		t.Fatalf("unknown level must be dropped: %+v %v", res, err)
 	}
 }

@@ -25,6 +25,8 @@ const (
 	// Claude Code's own limit on one MCP call. It must outlast the 10 minute
 	// approval window, or a slow human would look like a failed tool.
 	mcpToolTimeoutMS = "660000"
+
+	hookTimeoutSeconds = 660
 )
 
 // Bash and Read are the only built-in tools Claude gets. Edit and Write are
@@ -53,6 +55,15 @@ var disallowedTools = []string{
 	"Read(/etc/shadow)", "Read(**/credentials)", "Read(/proc/*/environ)",
 }
 
+// models is the list the backend offers. The value reaches claude's argv, so
+// anything else is refused instead of being passed through.
+var models = map[string]bool{
+	"claude-fable-5-1": true, "claude-opus-5-5": true, "claude-sonnet-5-5": true, "claude-haiku-5-5": true,
+}
+
+// levels are the server states the final answer may report.
+var levels = map[string]bool{"good": true, "fair": true, "warning": true, "critical": true}
+
 func (a *Agent) startConsultation(ctx context.Context, m incoming) {
 	fail := func(summary string) {
 		a.sendReliable(consultationStatusMsg{Type: "consultation_status", ConsultationID: m.ConsultationID, Status: "failed", Summary: summary})
@@ -63,6 +74,10 @@ func (a *Agent) startConsultation(ctx context.Context, m incoming) {
 	}
 	if m.MaxTurns <= 0 {
 		fail("maxTurns가 올바르지 않습니다")
+		return
+	}
+	if !models[m.Model] {
+		fail("지원하지 않는 모델입니다")
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, consultTimeout)
@@ -81,6 +96,7 @@ func (a *Agent) startConsultation(ctx context.Context, m incoming) {
 			a.mu.Lock()
 			a.active = nil
 			clear(a.useIDs)
+			clear(a.granted)
 			a.mu.Unlock()
 			cancel()
 		}()
@@ -93,7 +109,8 @@ func (a *Agent) startConsultation(ctx context.Context, m incoming) {
 		}
 		a.sendReliable(consultationStatusMsg{
 			Type: "consultation_status", ConsultationID: m.ConsultationID, Status: "done",
-			Summary: res.Summary, Recommendations: res.Recommendations,
+			Summary: res.Summary, Level: res.Level, Feedback: res.Feedback, Fixes: res.Fixes,
+			Recommendations: res.Recommendations,
 		})
 	}()
 }
@@ -111,7 +128,7 @@ func (a *Agent) invokeClaude(ctx context.Context, m incoming) (*consultResult, e
 	if err := os.MkdirAll(work, 0o700); err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, bin, claudeArgs(m.MaxTurns, exe, SocketPath(a.cfg.StateDir))...)
+	cmd := exec.CommandContext(ctx, bin, claudeArgs(m.Model, m.MaxTurns, exe, SocketPath(a.cfg.StateDir))...)
 	cmd.Dir = work
 	cmd.Env = childEnv(os.Environ(), m.AuthMode)
 	cmd.Stdin = strings.NewReader(buildPrompt(a.cfg.StateDir))
@@ -135,10 +152,13 @@ func (a *Agent) invokeClaude(ctx context.Context, m incoming) (*consultResult, e
 	return res, waitErr
 }
 
-func claudeArgs(maxTurns int, exe, socket string) []string {
+func claudeArgs(model string, maxTurns int, exe, socket string) []string {
 	hook := func(kind string) []map[string]any {
 		command := fmt.Sprintf("%s hook %s --socket %s", shellQuote(exe), kind, shellQuote(socket))
-		return []map[string]any{{"matcher": "*", "hooks": []map[string]string{{"type": "command", "command": command}}}}
+		return []map[string]any{{"matcher": "*", "hooks": []map[string]any{
+			// The pre hook waits for the web decision, so it must outlast the approval window.
+			{"type": "command", "command": command, "timeout": hookTimeoutSeconds},
+		}}}
 	}
 	settings := mustJSON(map[string]any{"hooks": map[string]any{
 		"PreToolUse":  hook("pre"),
@@ -153,6 +173,9 @@ func claudeArgs(maxTurns int, exe, socket string) []string {
 		"-p",
 		"--output-format", "stream-json",
 		"--verbose", // claude refuses stream-json under -p without it
+		"--model", model,
+		// Always auto. The hooks enforce the tiers whatever this mode decides.
+		"--permission-mode", "auto",
 		"--max-turns", fmt.Sprint(maxTurns),
 		"--tools", availableTools,
 		"--allowedTools", strings.Join(allowedTools, ","),
@@ -230,14 +253,26 @@ const promptTemplate = `당신은 이 서버 안에서 실행 중인 Green Serve
 
 ## 최종 응답
 
-마지막 응답은 다른 글 없이 아래 형식의 JSON 하나만 출력하세요. summary와 detail은 한국어로 씁니다.
+마지막 응답은 다른 글 없이 아래 형식의 JSON 하나만 출력하세요. 글은 모두 한국어로 간결하게 씁니다.
 
-{"summary":"진단과 조치 요약","recommendations":[{"type":"idle","detail":"무엇을 왜 권하는지","estSavingKrw":0}]}
+{"level":"good","summary":"한 문장 요약","feedback":["측정값을 근거로 한 짧은 피드백"],"fixes":["해결 단계"],"recommendations":[{"type":"idle","detail":"무엇을 왜 권하는지","estSavingKrw":0}]}
+
+level은 현재 서버 상태입니다.
+
+- good: 낭비나 이상이 없습니다.
+- fair: 줄일 여지가 조금 있습니다.
+- warning: 낭비가 크거나 장애 위험 징후가 있습니다.
+- critical: 폭주 프로세스, 과열, 디스크나 메모리 고갈처럼 바로 조치해야 합니다.
+
+feedback은 최대 5개이고 항목마다 한 문장입니다. fixes는 level이 warning이나 critical일 때 서버 주인이 순서대로 따라 할 해결 단계를 쓰고, 그 외에는 빈 배열로 둡니다.
 
 type은 idle, empty_game_server, oversized, night_stop, runaway_process 중에서 고르고, 맞는 것이 없으면 짧은 영어 snake_case를 씁니다. estSavingKrw는 측정값으로 계산한 월 절약 예상액(원)입니다.`
 
 type consultResult struct {
+	Level           string           `json:"level"`
 	Summary         string           `json:"summary"`
+	Feedback        []string         `json:"feedback"`
+	Fixes           []string         `json:"fixes"`
 	Recommendations []recommendation `json:"recommendations"`
 }
 
@@ -277,6 +312,9 @@ func parseStream(r io.Reader) (*consultResult, error) {
 	}
 	if strings.TrimSpace(res.Summary) == "" {
 		return nil, errors.New("final answer has no summary")
+	}
+	if !levels[res.Level] {
+		res.Level = "" // the run already cost tokens: keep the report, drop the bad field
 	}
 	return &res, nil
 }

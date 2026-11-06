@@ -54,6 +54,9 @@ type consultationStatusMsg struct {
 	ConsultationID  int64            `json:"consultationId"`
 	Status          string           `json:"status"`
 	Summary         string           `json:"summary,omitempty"`
+	Level           string           `json:"level,omitempty"`
+	Feedback        []string         `json:"feedback,omitempty"`
+	Fixes           []string         `json:"fixes,omitempty"`
 	Recommendations []recommendation `json:"recommendations,omitempty"`
 }
 
@@ -69,6 +72,7 @@ type incoming struct {
 	ConsultationID int64  `json:"consultationId"`
 	AuthMode       string `json:"authMode"`
 	MaxTurns       int    `json:"maxTurns"`
+	Model          string `json:"model"`
 	RequestID      string `json:"requestId"`
 	Decision       string `json:"decision"`
 	ToolCallID     int64  `json:"toolCallId"`

@@ -79,15 +79,8 @@ func preHook(in hookInput, stdout, stderr io.Writer, socket string) int {
 		fmt.Fprintln(stderr, "greenserver: blocked:", resp.Message)
 		return 2
 	}
-	if v.Tier == classify.Approve {
-		// Force the prompt tool even if an allow rule happened to match.
-		// The hook never answers "allow": it can only tighten.
-		json.NewEncoder(stdout).Encode(map[string]any{"hookSpecificOutput": map[string]string{
-			"hookEventName":            "PreToolUse",
-			"permissionDecision":       "ask",
-			"permissionDecisionReason": "Green Server: needs approval on the web",
-		}})
-	}
+	// An approve-tier call only gets here after the owner approved it: the agent
+	// answered from waitForDecision. Stays silent, so a hook can only tighten.
 	return 0
 }
 

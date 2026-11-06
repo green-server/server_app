@@ -66,6 +66,7 @@ type Agent struct {
 	queue   [][]byte      // reliable messages waiting for a link
 	pending map[string]chan string
 	useIDs  map[string]string // command -> tool_use_id, seen by the pre hook
+	granted map[string]bool   // command approved by the pre hook, for the prompt tool that may follow
 	active  *consultation
 }
 
@@ -97,6 +98,7 @@ func New(cfg Config) (*Agent, error) {
 		runUndo:      shellUndo,
 		pending:      map[string]chan string{},
 		useIDs:       map[string]string{},
+		granted:      map[string]bool{},
 	}, nil
 }
 
@@ -450,10 +452,19 @@ func (a *Agent) preCheck(c *consultation, req ipcRequest, v classify.Verdict) ip
 	case v.Tier == classify.Auto:
 		a.sendReliable(toolCallMsg{"tool_call", c.id, req.ToolUseID, v.Command, v.Tier, "auto", nil})
 		a.logCall(c, req.ToolUseID, v, "auto")
-	default: // reported as pending when the approval is requested
+	default:
+		// Web approval happens here, not in the prompt tool: auto mode may never
+		// call the prompt tool, and an approve-tier command must not run unasked.
 		a.mu.Lock()
 		a.useIDs[v.Command] = req.ToolUseID
 		a.mu.Unlock()
+		resp := a.requestApproval(c, req, v)
+		if resp.Allow {
+			a.mu.Lock()
+			a.granted[v.Command] = true
+			a.mu.Unlock()
+		}
+		return resp
 	}
 	return ipcResponse{Allow: true}
 }
@@ -466,6 +477,17 @@ func (a *Agent) approve(c *consultation, req ipcRequest, v classify.Verdict) ipc
 	if v.Tier == classify.Auto {
 		return ipcResponse{Allow: true}
 	}
+	a.mu.Lock()
+	granted := a.granted[v.Command]
+	delete(a.granted, v.Command)
+	a.mu.Unlock()
+	if granted {
+		return ipcResponse{Allow: true}
+	}
+	return a.requestApproval(c, req, v)
+}
+
+func (a *Agent) requestApproval(c *consultation, req ipcRequest, v classify.Verdict) ipcResponse {
 	id := a.requestID(req, v)
 	decision := a.waitForDecision(c, id, v)
 	// The audit log is the undo ledger. An action whose undo could not be
