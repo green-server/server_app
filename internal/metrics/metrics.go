@@ -64,6 +64,7 @@ type Sampler struct {
 	cpuTotal  uint64
 	cpuBusy   uint64
 	procTicks map[int]uint64
+	floor     float64 // lowest measured CPU watts so far, the idle draw
 }
 
 func New(p Profile) *Sampler {
@@ -95,21 +96,36 @@ func (s *Sampler) Sample() (Sample, error) {
 	}
 	gpu, _ := s.gpuWatts()
 	watts, measured := s.readRAPL(time.Now())
-	if !measured {
+	idle := s.Profile.IdleWatts
+	if measured {
+		// ponytail: the lowest reading since start stands in for idle draw; it is
+		// too high until the host has been quiet once.
+		if s.floor == 0 || watts < s.floor {
+			s.floor = watts
+		}
+		idle = s.floor
+	} else {
 		watts = s.Profile.Estimate(cpu)
 	}
 	out := Sample{CPUPct: cpu, MemPct: mem, Watts: watts + gpu, IsEstimated: !measured}
-	out.Processes = apportion(procs, out.Watts)
+	// Idle draw and the GPU are not caused by CPU time, so only the rest is split.
+	out.Processes = apportion(procs, max(watts-idle, 0))
 	return out, nil
 }
 
 // apportion splits watts by CPU share over all processes, then keeps the top.
+// The caller passes only the load-dependent CPU watts.
 func apportion(procs []Process, watts float64) []Process {
 	var total float64
 	for _, p := range procs {
 		total += p.CPUPct
 	}
-	sort.SliceStable(procs, func(i, j int) bool { return procs[i].CPUPct > procs[j].CPUPct })
+	sort.Slice(procs, func(i, j int) bool {
+		if procs[i].CPUPct != procs[j].CPUPct {
+			return procs[i].CPUPct > procs[j].CPUPct
+		}
+		return procs[i].PID < procs[j].PID
+	})
 	if len(procs) > topProcesses {
 		procs = procs[:topProcesses]
 	}

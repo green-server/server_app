@@ -8,13 +8,17 @@ Linux와 systemd가 필요합니다. 토큰은 웹에서 서버를 등록할 때
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/green-server/server_app/main/install.sh \
-  | sudo GREENSERVER_TOKEN=<토큰> bash -s -- --server wss://<백엔드>/ws/agent --services nginx,minecraft
+  | sudo bash -s -- --server wss://<백엔드>/ws/agent --services nginx,minecraft
 ```
+
+실행하면 토큰을 묻습니다. 입력한 토큰은 화면, `ps`, 시스템 로그에 남지 않습니다. `sudo GREENSERVER_TOKEN=...`처럼 넘기면 sudo가 받은 환경 변수를 저널에 기록하므로 쓰지 마세요. 터미널이 없는 자동화에서만 `GREENSERVER_TOKEN`을 쓰고, 이때는 `sudo` 없이 root로 실행합니다.
+
+바이너리를 내려받고 체크섬을 확인한 뒤에야 시스템을 바꾸므로, 다운로드가 실패하면 아무것도 설치되지 않습니다. 그 뒤에 실패해도 토큰은 그대로 유효하니 같은 명령을 다시 실행하면 됩니다.
 
 | 옵션 | 설명 |
 |---|---|
 | `--server URL` | 백엔드 주소. 필수 |
-| `--services a,b` | AI가 승인 없이 sudo로 중지, 시작, 재시작할 수 있는 서비스. 생략하면 없음 |
+| `--services a,b` | AI가 승인 없이 sudo로 중지, 시작, 재시작할 수 있는 서비스. 되돌리는 명령을 함께 기록해야 실행됩니다. 생략하면 없음 |
 | `--grant-key KEY`, `--server-id N` | 브라우저에서 허용한 root 명령을 실행하는 root 도우미를 설치. KEY는 `GET /api/grant-public-key` 값 |
 | `--idle-watts N`, `--max-watts N` | RAPL이 없을 때 쓰는 전력 프로필 |
 | `--binary PATH` | 릴리스를 내려받지 않고 이 파일을 설치 |
@@ -47,10 +51,10 @@ greenserver version
 
 ## 전력 측정
 
-- 베어메탈, 집 PC: RAPL 에너지 카운터의 변화량과 `nvidia-smi`로 실측합니다.
+- 베어메탈, 집 PC: RAPL 에너지 카운터의 변화량과 `nvidia-smi`로 실측합니다. 잰 범위는 CPU 패키지, DRAM 영역(있을 때), NVIDIA GPU입니다. 메인보드, 디스크, 화면, 전원부 손실은 빠지므로 벽에서 잰 값보다 낮습니다.
 - 클라우드 VM이나 RAPL을 읽을 수 없는 경우: `idle + (max - idle) × CPU%`로 추정하고 `isEstimated: true`로 보냅니다. GPU만 실측되어도 전체 값은 추정으로 표시합니다.
 - 실측 서버와 비교해 `--idle-watts`, `--max-watts`를 맞추면 추정 오차를 줄일 수 있습니다.
-- 프로세스별 전력은 전체 전력을 CPU 점유율로 나눈 값입니다.
+- 프로세스별 전력은 추정입니다. CPU 전력에서 대기 전력을 뺀 부분만 CPU 점유율로 나눕니다. 대기 전력은 실측이면 지금까지의 최저값, 추정이면 `--idle-watts`이고, GPU 전력은 나누지 않습니다.
 
 ## 권한
 
@@ -76,6 +80,10 @@ sudo -n systemctl stop minecraft # undo: sudo -n systemctl start minecraft
 - 되돌리기가 없는 approve 명령은 웹에 묻지 않고 거부합니다.
 - 파일 수정은 Edit 도구를 막고 Bash로만 하므로 모든 변경이 같은 규칙을 따릅니다.
 - `undo` 메시지는 이 에이전트가 조치와 함께 기록한 문자열과 정확히 같을 때만 실행합니다. 그 외에는 실행하지 않고 `exitCode: 126`으로 응답합니다.
+
+## 릴리스
+
+`v*` 태그를 푸시하면 `.github/workflows/release.yml`이 linux amd64와 arm64 바이너리, 체크섬을 릴리스에 올립니다.
 
 ## 개발
 

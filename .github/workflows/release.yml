@@ -1,0 +1,32 @@
+# Builds the agent for every tag and attaches it to a release. install.sh
+# downloads greenserver-linux-<arch> and its .sha256 from the latest one.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - name: build
+        run: |
+          mkdir dist
+          for arch in amd64 arm64; do
+            out="greenserver-linux-$arch"
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" -o "dist/$out" ./cmd/greenserver
+            (cd dist && sha256sum "$out" > "$out.sha256")
+          done
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

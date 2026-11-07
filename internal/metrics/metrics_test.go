@@ -252,3 +252,24 @@ func TestRealSampler(t *testing.T) {
 		t.Fatalf("%+v", got)
 	}
 }
+
+// Idle draw and GPU power are not handed to processes: on an idle estimate host
+// nothing is split, and a measured host splits only what rises above its floor.
+func TestProcessesGetOnlyLoadPower(t *testing.T) {
+	root := t.TempDir()
+	procRoot(t, root, 0, map[int]int{7: 0}, "")
+	s := newSampler(Profile{10, 100}, root)
+	s.gpuWatts = func() (float64, bool) { return 15, true }
+	s.baseline()
+	procRoot(t, root, 1000, map[int]int{7: 1}, "") // a sliver of CPU, mostly idle
+	got, err := s.Sample()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := got.Processes[0]; p.Watts > got.Watts-15-10 {
+		t.Fatalf("process got %v W of %v W, more than the load share", p.Watts, got.Watts)
+	}
+	if got := apportion([]Process{{PID: 2, CPUPct: 1}, {PID: 1, CPUPct: 1}}, 4); got[0].PID != 1 {
+		t.Fatalf("ties must keep a stable order: %+v", got)
+	}
+}

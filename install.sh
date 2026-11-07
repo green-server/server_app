@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Green Server agent installer.
 #
-#   curl -fsSL <url>/install.sh | sudo GREENSERVER_TOKEN=<token> bash -s -- \
+#   curl -fsSL <url>/install.sh | sudo bash -s -- \
 #     --server wss://host/ws/agent --services nginx,minecraft
 #
-# The token is read from the environment so it stays out of ps output.
+# The token is asked for on the terminal, so it reaches neither ps output nor
+# the journal, where sudo logs the environment it was given.
 set -euo pipefail
 
 RELEASE_URL="https://github.com/green-server/server_app/releases/latest/download"
@@ -20,13 +21,26 @@ TMPFILES="/etc/tmpfiles.d/greenserver-rapl.conf"
 
 die() { echo "greenserver install: $*" >&2; exit 1; }
 
+WORK_DIR=""
+CHANGING=0
+# Every step after the download is safe to repeat, so a failure there is fixed
+# by running the same command again.
+on_exit() {
+  local status=$?
+  [[ -z $WORK_DIR ]] || rm -rf "$WORK_DIR"
+  if [[ $status -ne 0 && $CHANGING -eq 1 ]]; then
+    echo "greenserver install: stopped partway. The token is still valid; run the same command again." >&2
+  fi
+}
+
 usage() {
   cat <<'EOF'
-Usage: GREENSERVER_TOKEN=<token> install.sh --server URL [options]
+Usage: install.sh --server URL [options]
 
   --server URL        backend URL, wss://host/ws/agent (required)
   --services a,b      systemd services the AI may stop, start and restart
-                      after your approval. Empty means none.
+                      without asking, as long as it records the undo command.
+                      Empty means none.
   --idle-watts N      estimated watts at 0% CPU, for hosts without RAPL
   --max-watts N       estimated watts at 100% CPU, for hosts without RAPL
   --binary PATH       install this binary instead of downloading a release
@@ -68,7 +82,13 @@ main() {
   command -v visudo >/dev/null || die "sudo is required"
   # Only characters with no meaning in a systemd unit, where $ and % expand.
   [[ $server =~ ^wss://[A-Za-z0-9._:/-]+$ ]] || die "--server must be a plain wss:// URL"
-  [[ -n ${GREENSERVER_TOKEN:-} ]] || die "set GREENSERVER_TOKEN"
+  if [[ -z ${GREENSERVER_TOKEN:-} ]]; then
+    # stdin is this script when piped from curl, so read from the terminal.
+    { : </dev/tty; } 2>/dev/null || die "no terminal to ask for the token; set GREENSERVER_TOKEN"
+    read -r -s -p "Agent token: " GREENSERVER_TOKEN </dev/tty 2>/dev/tty || true
+    echo >/dev/tty
+    [[ -n $GREENSERVER_TOKEN ]] || die "no token given"
+  fi
   [[ $GREENSERVER_TOKEN != *$'\n'* ]] || die "invalid GREENSERVER_TOKEN"
   local n
   for n in "$idle_watts" "$max_watts"; do
@@ -88,9 +108,14 @@ main() {
     valid_service "$s" || die "refusing service: $s"
   done
 
-  # Everything that can fail on input has now been checked.
+  # Fetch first: a failed download used to leave the account behind.
+  local staged
+  WORK_DIR="$(mktemp -d)"
+  trap on_exit EXIT
+  staged="$(fetch_binary "$binary" "$WORK_DIR")"
+  CHANGING=1
   create_account
-  install_binary "$binary"
+  install -o root -g root -m 0755 "$staged" "$BIN"
   install_env
   install_rapl_access
   install_sudoers "${service_list[@]+"${service_list[@]}"}"
@@ -107,6 +132,7 @@ main() {
     systemctl restart greenserver-root.service
   fi
 
+  CHANGING=0
   cat <<EOF
 
 greenserver is running. Check it with: systemctl status greenserver
@@ -130,11 +156,12 @@ create_account() {
   install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0700 "$STATE_DIR"
 }
 
-install_binary() {
-  local src="$1" tmp arch
+# Prints the path of a checked binary without changing anything on the system.
+fetch_binary() {
+  local src="$1" tmp="$2" arch
   if [[ -n $src ]]; then
     [[ -f $src ]] || die "no such binary: $src"
-    install -o root -g root -m 0755 "$src" "$BIN"
+    echo "$src"
     return
   fi
   case "$(uname -m)" in
@@ -142,13 +169,12 @@ install_binary() {
     aarch64) arch=arm64 ;;
     *)       die "unsupported architecture: $(uname -m)" ;;
   esac
-  tmp="$(mktemp -d)"
-  # shellcheck disable=SC2064 # expand now: tmp is local and gone by exit time
-  trap "rm -rf '$tmp'" EXIT
-  curl -fsSL -o "$tmp/greenserver-linux-$arch" "$RELEASE_URL/greenserver-linux-$arch"
-  curl -fsSL -o "$tmp/greenserver-linux-$arch.sha256" "$RELEASE_URL/greenserver-linux-$arch.sha256"
-  (cd "$tmp" && sha256sum -c --quiet "greenserver-linux-$arch.sha256") || die "checksum mismatch"
-  install -o root -g root -m 0755 "$tmp/greenserver-linux-$arch" "$BIN"
+  curl -fsSL -o "$tmp/greenserver-linux-$arch" "$RELEASE_URL/greenserver-linux-$arch" \
+    || die "could not download the agent; nothing was installed"
+  curl -fsSL -o "$tmp/greenserver-linux-$arch.sha256" "$RELEASE_URL/greenserver-linux-$arch.sha256" \
+    || die "could not download the checksum; nothing was installed"
+  (cd "$tmp" && sha256sum -c --quiet "greenserver-linux-$arch.sha256" >&2) || die "checksum mismatch; nothing was installed"
+  echo "$tmp/greenserver-linux-$arch"
 }
 
 # Root-owned: systemd reads this file, the greenserver account cannot.
