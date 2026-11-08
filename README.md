@@ -22,6 +22,9 @@ curl -fsSL https://raw.githubusercontent.com/green-server/server_app/main/instal
 | `--grant-key KEY`, `--server-id N` | 브라우저에서 허용한 root 명령을 실행하는 root 도우미를 설치. KEY는 `GET /api/grant-public-key` 값 |
 | `--idle-watts N`, `--max-watts N` | RAPL이 없을 때 쓰는 전력 프로필 |
 | `--binary PATH` | 릴리스를 내려받지 않고 이 파일을 설치 |
+| `--uid N` | `greenserver` 계정의 UID와 GID. 생략하면 900부터 아래로 빈 번호를 씁니다 |
+
+계정 UID는 컨테이너 이미지가 흔히 쓰는 999와 1000을 피합니다. 같은 UID면 커널은 컨테이너 프로세스를 이 계정 것으로 보고, 에이전트가 그 프로세스에 신호를 보낼 수 있기 때문입니다. 예전 설치로 999나 1000을 받은 계정은 다시 설치하면 새 UID로 옮겨집니다.
 
 설치 스크립트는 전용 계정 `greenserver`, 바이너리, systemd 유닛, sudoers 화이트리스트, RAPL 읽기 권한을 준비합니다. AI 컨설팅을 쓰려면 이 계정에 Claude Code를 설치한 뒤 인증합니다.
 
@@ -51,7 +54,7 @@ greenserver version
 
 ## 전력 측정
 
-- 베어메탈, 집 PC: RAPL 에너지 카운터의 변화량과 `nvidia-smi`로 실측합니다. 잰 범위는 CPU 패키지, DRAM 영역(있을 때), NVIDIA GPU입니다. 메인보드, 디스크, 화면, 전원부 손실은 빠지므로 벽에서 잰 값보다 낮습니다.
+- 베어메탈, 집 PC: RAPL 에너지 카운터의 변화량과 `nvidia-smi`로 실측합니다. `nvidia-smi`는 반복 모드로 하나만 띄워 두고 읽습니다. 잰 범위는 CPU 패키지, DRAM 영역(있을 때), NVIDIA GPU입니다. 메인보드, 디스크, 화면, 전원부 손실은 빠지므로 벽에서 잰 값보다 낮습니다.
 - 클라우드 VM이나 RAPL을 읽을 수 없는 경우: `idle + (max - idle) × CPU%`로 추정하고 `isEstimated: true`로 보냅니다. GPU만 실측되어도 전체 값은 추정으로 표시합니다.
 - 실측 서버와 비교해 `--idle-watts`, `--max-watts`를 맞추면 추정 오차를 줄일 수 있습니다.
 - 프로세스별 전력은 추정입니다. CPU 전력에서 대기 전력을 뺀 부분만 CPU 점유율로 나눕니다. 대기 전력은 실측이면 지금까지의 최저값, 추정이면 `--idle-watts`이고, GPU 전력은 나누지 않습니다.

@@ -4,6 +4,7 @@
 package metrics
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -69,7 +71,7 @@ type Sampler struct {
 
 func New(p Profile) *Sampler {
 	s := newSampler(p, "/")
-	s.gpuWatts = nvidiaWatts
+	s.gpuWatts = (&gpu{}).read
 	s.psOutput = psOutput
 	s.baseline()
 	return s
@@ -216,30 +218,78 @@ func readUint(path string) (uint64, error) {
 	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 }
 
-func nvidiaWatts() (float64, bool) {
-	if _, err := exec.LookPath("nvidia-smi"); err != nil {
-		return 0, false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits").Output()
-	if err != nil {
-		return 0, false
-	}
-	return parseNvidia(string(out))
+// gpu keeps one nvidia-smi running in loop mode instead of starting one per
+// sample, which cost about as much CPU as the rest of the agent.
+type gpu struct {
+	mu      sync.Mutex
+	absent  bool
+	running bool
+	watts   map[string]float64 // by GPU index
+	at      time.Time
 }
 
-// parseNvidia sums one watt value per GPU. Lines such as "[N/A]" are skipped.
-func parseNvidia(out string) (float64, bool) {
-	var total float64
-	found := false
-	for _, line := range strings.Split(out, "\n") {
-		if w, err := strconv.ParseFloat(strings.TrimSpace(line), 64); err == nil {
-			total += w
-			found = true
-		}
+func (g *gpu) read() (float64, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.absent {
+		return 0, false
 	}
-	return total, found
+	if !g.running {
+		g.start()
+	}
+	// Two missed intervals: the reader died or the driver hung, so say nothing.
+	if len(g.watts) == 0 || time.Since(g.at) > 25*time.Second {
+		return 0, false
+	}
+	var total float64
+	for _, w := range g.watts {
+		total += w
+	}
+	return total, true
+}
+
+// start runs with g.mu held.
+func (g *gpu) start() {
+	if _, err := exec.LookPath("nvidia-smi"); err != nil {
+		g.absent = true
+		return
+	}
+	cmd := exec.Command("nvidia-smi", "--query-gpu=index,power.draw", "--format=csv,noheader,nounits", "-lms", "10000")
+	out, err := cmd.StdoutPipe()
+	if err != nil || cmd.Start() != nil {
+		return // tried again on the next sample
+	}
+	g.running = true
+	go func() {
+		scan := bufio.NewScanner(out)
+		for scan.Scan() {
+			if index, w, ok := parseNvidiaLine(scan.Text()); ok {
+				g.mu.Lock()
+				if g.watts == nil {
+					g.watts = map[string]float64{}
+				}
+				g.watts[index], g.at = w, time.Now()
+				g.mu.Unlock()
+			}
+		}
+		cmd.Wait()
+		g.mu.Lock()
+		g.running, g.watts = false, nil
+		g.mu.Unlock()
+	}()
+}
+
+// parseNvidiaLine reads "0, 15.23". A GPU that reports "[N/A]" is skipped.
+func parseNvidiaLine(line string) (index string, watts float64, ok bool) {
+	index, value, found := strings.Cut(line, ",")
+	if !found {
+		return "", 0, false
+	}
+	w, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return strings.TrimSpace(index), w, true
 }
 
 func (s *Sampler) readSystem() (cpu, mem float64, procs []Process, err error) {

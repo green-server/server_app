@@ -223,10 +223,10 @@ func TestApportion(t *testing.T) {
 }
 
 func TestParsers(t *testing.T) {
-	if w, ok := parseNvidia("35.20\n[N/A]\n10.5\n"); !ok || !near(w, 45.7) {
-		t.Fatalf("%v %v", w, ok)
+	if i, w, ok := parseNvidiaLine("1, 35.20"); !ok || i != "1" || !near(w, 35.2) {
+		t.Fatalf("%v %v %v", i, w, ok)
 	}
-	if _, ok := parseNvidia("[N/A]\n"); ok {
+	if _, _, ok := parseNvidiaLine("0, [N/A]"); ok {
 		t.Fatal("no reading must be reported as absent")
 	}
 	cpu, mem, procs := parsePS("  12  80.0  1.5 /usr/bin/my app\n  13  0.0  2.5 idle\nnoise\n", 4)
@@ -271,5 +271,28 @@ func TestProcessesGetOnlyLoadPower(t *testing.T) {
 	}
 	if got := apportion([]Process{{PID: 2, CPUPct: 1}, {PID: 1, CPUPct: 1}}, 4); got[0].PID != 1 {
 		t.Fatalf("ties must keep a stable order: %+v", got)
+	}
+}
+
+// One nvidia-smi stays up and every GPU it reports is summed.
+func TestGPUReaderKeepsOneProcess(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "nvidia-smi"), "#!/bin/sh\nprintf '0, 10.5\\n1, 4.5\\n'\nexec sleep 30\n")
+	os.Chmod(filepath.Join(dir, "nvidia-smi"), 0o755)
+	t.Setenv("PATH", dir)
+	g := &gpu{}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		w, ok := g.read()
+		if ok && near(w, 15) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("got %v %v", w, ok)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !g.running {
+		t.Fatal("reader must stay running between samples")
 	}
 }

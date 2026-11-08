@@ -44,6 +44,9 @@ Usage: install.sh --server URL [options]
   --idle-watts N      estimated watts at 0% CPU, for hosts without RAPL
   --max-watts N       estimated watts at 100% CPU, for hosts without RAPL
   --binary PATH       install this binary instead of downloading a release
+  --uid N             uid and gid for the greenserver account (default: a free
+                      id from 900 down, away from the 999 and 1000 that many
+                      container images run as)
   --grant-key KEY     backend public key; with --server-id, installs the root
                       helper so root commands can be allowed from the browser
   --server-id N       id of this server on the backend
@@ -61,7 +64,7 @@ valid_service() {
 }
 
 main() {
-  local server="" services="" idle_watts="" max_watts="" binary="" grant_key="" server_id=""
+  local server="" services="" idle_watts="" max_watts="" binary="" grant_key="" server_id="" uid=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --server)     server="${2:?}"; shift 2 ;;
@@ -71,6 +74,7 @@ main() {
       --binary)     binary="${2:?}"; shift 2 ;;
       --grant-key)  grant_key="${2:?}"; shift 2 ;;
       --server-id)  server_id="${2:?}"; shift 2 ;;
+      --uid)        uid="${2:?}"; shift 2 ;;
       -h|--help)    usage; exit 0 ;;
       *)            usage >&2; die "unknown option: $1" ;;
     esac
@@ -97,6 +101,7 @@ main() {
 
   [[ -z $grant_key || $grant_key =~ ^[A-Za-z0-9+/]{43}=$ ]] || die "--grant-key must be a base64 public key"
   [[ -z $server_id || $server_id =~ ^[0-9]+$ ]] || die "--server-id must be a number"
+  [[ -z $uid || $uid =~ ^[1-9][0-9]*$ ]] || die "--uid must be a positive number"
   [[ -z $grant_key && -z $server_id || -n $grant_key && -n $server_id ]] || die "--grant-key and --server-id go together"
 
   local -a service_list=()
@@ -114,7 +119,7 @@ main() {
   trap on_exit EXIT
   staged="$(fetch_binary "$binary" "$WORK_DIR")"
   CHANGING=1
-  create_account
+  create_account "$uid"
   install -o root -g root -m 0755 "$staged" "$BIN"
   install_env
   install_rapl_access
@@ -145,11 +150,54 @@ To change which services can be managed, run this installer again.
 EOF
 }
 
+# Container images often run as 999 or 1000. A host account with the same id
+# owns those container processes as far as the kernel is concerned, so the
+# agent could signal them. The account gets an id containers rarely use.
+free_id() {
+  local id
+  for ((id = 900; id >= 500; id--)); do
+    if ! getent passwd "$id" >/dev/null && ! getent group "$id" >/dev/null; then
+      echo "$id"
+      return
+    fi
+  done
+  die "no free uid between 500 and 900; pass --uid"
+}
+
+id_taken() {
+  getent passwd "$1" >/dev/null && [[ $(getent passwd "$1" | cut -d: -f1) != "$ACCOUNT" ]] && return 0
+  getent group "$1" >/dev/null && [[ $(getent group "$1" | cut -d: -f1) != "$ACCOUNT" ]] && return 0
+  return 1
+}
+
 create_account() {
-  if ! id "$ACCOUNT" >/dev/null 2>&1; then
+  local want="$1" have
+  if id "$ACCOUNT" >/dev/null 2>&1; then
+    have="$(id -u "$ACCOUNT")"
+    # Earlier installers let useradd pick, which usually meant 999.
+    if [[ -z $want && ( $have == 999 || $have == 1000 ) ]]; then
+      want="$(free_id)"
+    fi
+    if [[ -n $want && $want != "$have" ]]; then
+      id_taken "$want" && die "uid $want is already in use"
+      echo "Moving $ACCOUNT from uid $have to $want"
+      systemctl stop greenserver.service 2>/dev/null || true
+      if getent group "$ACCOUNT" >/dev/null; then
+        groupmod -g "$want" "$ACCOUNT"
+      else
+        groupadd --system -g "$want" "$ACCOUNT"
+      fi
+      usermod -u "$want" -g "$want" "$ACCOUNT"
+      # usermod only fixes the home directory; the crontab lives elsewhere.
+      find /var/spool/cron -user "$have" -exec chown "$want:$want" {} + 2>/dev/null || true
+    fi
+  else
+    [[ -n $want ]] || want="$(free_id)"
+    id_taken "$want" && die "uid $want is already in use"
+    getent group "$ACCOUNT" >/dev/null || groupadd --system -g "$want" "$ACCOUNT"
     # A real shell because Claude's Bash tool needs one. The password stays
     # locked, so nobody can log in with it.
-    useradd --system --create-home --home-dir "$HOME_DIR" --shell /bin/bash "$ACCOUNT"
+    useradd --system -u "$want" -g "$ACCOUNT" --create-home --home-dir "$HOME_DIR" --shell /bin/bash "$ACCOUNT"
   fi
   passwd -l "$ACCOUNT" >/dev/null
   install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$HOME_DIR"
