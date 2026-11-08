@@ -279,7 +279,7 @@ func TestGPUReaderKeepsOneProcess(t *testing.T) {
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, "nvidia-smi"), "#!/bin/sh\nprintf '0, 10.5\\n1, 4.5\\n'\nexec sleep 30\n")
 	os.Chmod(filepath.Join(dir, "nvidia-smi"), 0o755)
-	t.Setenv("PATH", dir)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	g := &gpu{}
 	deadline := time.Now().Add(3 * time.Second)
 	for {
