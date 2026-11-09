@@ -31,8 +31,11 @@ import (
 const (
 	refusedExitCode = 126 // undo_result for an undo this agent refused to run
 	queueLimit      = 1000
-	writeTimeout    = 10 * time.Second
-	undoTimeout     = 2 * time.Minute
+	// backlogLimit holds 24 hours of samples taken while the link is down, so an
+	// outage does not read as a stopped server. ponytail: lost on agent restart.
+	backlogLimit = 8640
+	writeTimeout = 10 * time.Second
+	undoTimeout  = 2 * time.Minute
 )
 
 type Config struct {
@@ -62,10 +65,11 @@ type Agent struct {
 	backoffMax   time.Duration
 	runUndo      func(ctx context.Context, command string) int
 
-	mu     sync.Mutex // also serializes WebSocket writes
-	conn   *websocket.Conn
-	queue  [][]byte // reliable messages waiting for a link
-	active *consultation
+	mu      sync.Mutex // also serializes WebSocket writes
+	conn    *websocket.Conn
+	queue   [][]byte // reliable messages waiting for a link
+	backlog [][]byte // metrics taken while offline, without processes
+	active  *consultation
 
 	approvalWait time.Duration
 	down         chan struct{} // closed when the current link drops
@@ -243,6 +247,12 @@ func (a *Agent) attach(ctx context.Context, conn *websocket.Conn) error {
 		}
 		a.queue = a.queue[1:]
 	}
+	for len(a.backlog) > 0 {
+		if err := write(ctx, conn, a.backlog[0]); err != nil {
+			return err
+		}
+		a.backlog = a.backlog[1:]
+	}
 	a.conn, a.down = conn, make(chan struct{})
 	return nil
 }
@@ -340,9 +350,27 @@ func (a *Agent) metricsLoop(ctx context.Context) {
 			continue
 		}
 		m := metricsMsg{"metrics", time.Now().UTC().Format(time.RFC3339), s.CPUPct, s.MemPct, s.Watts, s.IsEstimated, s.Processes}
-		a.send(m)
+		if !a.send(m) {
+			a.keep(m)
+		}
 		a.writeLatest(m)
 	}
+}
+
+// keep buffers a sample the link could not take. Processes are dropped: they
+// only feed the live view and the runaway rule, and would make the backlog large.
+func (a *Agent) keep(m metricsMsg) {
+	m.Processes = []metrics.Process{}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.backlog) >= backlogLimit {
+		a.backlog = a.backlog[1:]
+	}
+	a.backlog = append(a.backlog, data)
 }
 
 // writeLatest gives Claude something to remeasure with: the agent's own

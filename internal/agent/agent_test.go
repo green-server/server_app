@@ -356,6 +356,32 @@ func TestQueuedRecordsSurviveALinkDrop(t *testing.T) {
 	}
 }
 
+func TestOfflineSamplesArriveAfterReconnect(t *testing.T) {
+	a, b, c := connected(t)
+	c.CloseNow()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		a.mu.Lock()
+		gone := a.conn == nil
+		a.mu.Unlock()
+		if gone {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	a.keep(metricsMsg{Type: "metrics", TS: "2026-01-01T00:00:00Z", Watts: 42, Processes: []metrics.Process{{PID: 1}}})
+	for {
+		m := b.expect("metrics")
+		if m["ts"] != "2026-01-01T00:00:00Z" {
+			continue // live samples from the reconnected loop
+		}
+		if procs, ok := m["processes"].([]any); !ok || len(procs) != 0 || m["watts"] != float64(42) {
+			t.Fatalf("%v", m)
+		}
+		return
+	}
+}
+
 func hookRun(t *testing.T, kind, stdin, socket string) (int, string, string) {
 	t.Helper()
 	var out, errOut bytes.Buffer
