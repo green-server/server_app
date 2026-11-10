@@ -43,3 +43,13 @@ func TestScenariosPeakAtDifferentTimes(t *testing.T) {
 		t.Errorf("batch %v %v", a, b)
 	}
 }
+
+func TestCalmStaysNearIdle(t *testing.T) {
+	calm = true
+	defer func() { calm = false }()
+	s := scenarios["game"]
+	at := time.Date(2026, 11, 7, 21, 30, 0, 0, kst) // the game's peak
+	if _, _, watts := s.reading(at); watts > s.Idle+(s.Max-s.Idle)*0.11 {
+		t.Fatalf("calm peak drew %v W", watts)
+	}
+}

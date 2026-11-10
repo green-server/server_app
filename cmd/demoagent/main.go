@@ -128,8 +128,14 @@ func noise(name string, t time.Time) float64 {
 	return float64(h.Sum32()%2000)/1000 - 1
 }
 
+// calm (DEMO_CALM=1) keeps every server near idle, so the fleet draws less than its week.
+var calm bool
+
 func (s scenario) reading(t time.Time) (cpu, mem, watts float64) {
 	load := math.Min(1, math.Max(0, s.Load(t)+0.025*noise(s.Name, t)))
+	if calm {
+		load *= 0.1
+	}
 	return math.Round(load*1000) / 10, s.Mem + 6*load, math.Round((s.Idle+(s.Max-s.Idle)*load)*100) / 100
 }
 
@@ -239,9 +245,10 @@ func run(ctx context.Context, url, token string, s scenario) error {
 	}
 }
 
-// DEMO_SERVERS is scenario=token pairs separated by commas.
+// DEMO_SERVERS is scenario=token pairs separated by commas; DEMO_CALM=1 idles the fleet.
 func main() {
 	url := os.Getenv("DEMO_URL")
+	calm = os.Getenv("DEMO_CALM") == "1"
 	pairs := strings.Split(os.Getenv("DEMO_SERVERS"), ",")
 	for _, pair := range pairs {
 		name, token, _ := strings.Cut(strings.TrimSpace(pair), "=")
