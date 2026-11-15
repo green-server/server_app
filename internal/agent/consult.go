@@ -10,7 +10,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -132,7 +131,7 @@ func (a *Agent) invokeClaude(ctx context.Context, m incoming) (*consultResult, e
 	if err != nil {
 		return nil, err
 	}
-	work := filepath.Join(a.cfg.StateDir, "work")
+	work := workDir(a.cfg.StateDir)
 	if err := os.MkdirAll(work, 0o700); err != nil {
 		return nil, err
 	}
@@ -212,7 +211,7 @@ func shellQuote(s string) string {
 // never reaches Claude. In subscription mode the API key variables must go,
 // or claude would bill the key instead of using the owner's login.
 func childEnv(environ []string, authMode string) []string {
-	drop := map[string]bool{"GREENSERVER_TOKEN": true, "MCP_TOOL_TIMEOUT": true}
+	drop := map[string]bool{"GREENSERVER_TOKEN": true, "MCP_TOOL_TIMEOUT": true, "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": true}
 	if authMode != "api_key" {
 		drop["ANTHROPIC_API_KEY"] = true
 		drop["ANTHROPIC_AUTH_TOKEN"] = true
@@ -224,7 +223,9 @@ func childEnv(environ []string, authMode string) []string {
 			out = append(out, kv)
 		}
 	}
-	return append(out, "MCP_TOOL_TIMEOUT="+mcpToolTimeoutMS)
+	// Each Bash call starts back in the work directory, where the classifier
+	// resolves relative paths; otherwise a cd would carry over to the next call.
+	return append(out, "MCP_TOOL_TIMEOUT="+mcpToolTimeoutMS, "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1")
 }
 
 func buildPrompt(stateDir, task string, readOnly bool) string {

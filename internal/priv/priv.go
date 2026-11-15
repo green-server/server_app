@@ -26,7 +26,15 @@ var name = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.@-]*$`)
 
 // protected can never be stopped, even with a valid grant: losing one of these
 // locks the owner out or takes this system down with it.
-var protected = regexp.MustCompile(`(?i)^(ssh|sshd|openssh.*|dropbear|cloudflared|tailscaled|docker|containerd|fail2ban|firewalld|ufw|nftables|iptables|ip6tables|greenserver.*|sudo|dbus|networking|networkmanager|wpa_supplicant|systemd-.*|cron|dokploy.*|green-.*)$`)
+var protected = regexp.MustCompile(`(?i)^(ssh|sshd|openssh.*|dropbear|cloudflared|tailscaled|docker|containerd|fail2ban|firewalld|ufw|nftables|iptables|ip6tables|greenserver.*|sudo|dbus|dbus-broker|polkit|networking|networkmanager|wpa_supplicant|systemd-.*|cron|dokploy.*|green-.*|getty|serial-getty|console-getty|container-getty|autovt|user|user-runtime-dir|rescue|emergency|poweroff|reboot|halt|kexec|debug-shell)$`)
+
+// unitTypes are the suffixes systemctl reads as a unit type. Only services are
+// on the list: a .target or .socket can power off the host or cut off ssh.
+var unitTypes = map[string]bool{"service": true, "socket": true, "target": true, "device": true, "mount": true, "automount": true, "swap": true, "timer": true, "path": true, "slice": true, "scope": true}
+
+// containerID matches what docker could resolve as a container ID or ID prefix,
+// which would get past the name check below.
+var containerID = regexp.MustCompile(`^[0-9a-f]+$`)
 
 var (
 	actions  = map[string]bool{"stop": true, "start": true, "restart": true}
@@ -48,12 +56,8 @@ func Parse(command string) ([]string, error) {
 	}
 	switch {
 	case len(argv) == 3 && (argv[0] == "docker" || argv[0] == "systemctl") && actions[argv[1]]:
-		target := strings.TrimSuffix(argv[2], ".service")
-		if !name.MatchString(target) {
-			return nil, fmt.Errorf("bad name %q", argv[2])
-		}
-		if protected.MatchString(target) {
-			return nil, fmt.Errorf("%s is protected", target)
+		if err := checkTarget(argv[0], argv[2]); err != nil {
+			return nil, err
 		}
 		return argv, nil
 	case len(argv) == 4 && argv[0] == "cpupower" && argv[1] == "frequency-set" && argv[2] == "-g" && governor[argv[3]]:
@@ -64,6 +68,28 @@ func Parse(command string) ([]string, error) {
 	return nil, errors.New("this command is not on the privileged list")
 }
 
+func checkTarget(tool, target string) error {
+	if !name.MatchString(target) {
+		return fmt.Errorf("bad name %q", target)
+	}
+	base := strings.TrimSuffix(target, ".service")
+	switch tool {
+	case "docker":
+		if containerID.MatchString(target) {
+			return fmt.Errorf("%s looks like a container ID, use the container name", target)
+		}
+	case "systemctl":
+		if i := strings.LastIndexByte(base, '.'); i >= 0 && unitTypes[strings.ToLower(base[i+1:])] {
+			return fmt.Errorf("%s is not a service", target)
+		}
+		base, _, _ = strings.Cut(base, "@") // getty@tty1 is an instance of getty
+	}
+	if protected.MatchString(base) {
+		return fmt.Errorf("%s is protected", target)
+	}
+	return nil
+}
+
 // Grant is the backend's signed permission for one exact command.
 type Grant struct {
 	Expires   int64  `json:"expires"`
@@ -71,7 +97,7 @@ type Grant struct {
 	Signature string `json:"signature"`
 }
 
-// message must match grants.ts in the backend byte for byte.
+// message must match grants.js in the backend byte for byte.
 func message(serverID, expires int64, nonce, command string) []byte {
 	return fmt.Appendf(nil, "green-server-grant-v1\n%d\n%d\n%s\n%s", serverID, expires, nonce, command)
 }

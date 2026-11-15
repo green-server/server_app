@@ -1,13 +1,13 @@
 package priv
 
 import (
-	"bufio"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -21,6 +21,8 @@ import (
 
 const (
 	maxOutput   = 4096
+	maxRequest  = 64 * 1024
+	readWait    = 10 * time.Second
 	commandWait = 2 * time.Minute
 )
 
@@ -165,11 +167,12 @@ func restrict(socket, group string) error {
 
 func (h *Helper) serveConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(commandWait + 10*time.Second))
+	conn.SetReadDeadline(time.Now().Add(readWait))
 	var r Request
-	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&r); err != nil {
+	if err := json.NewDecoder(io.LimitReader(conn, maxRequest)).Decode(&r); err != nil {
 		return
 	}
+	conn.SetDeadline(time.Now().Add(commandWait + 10*time.Second))
 	json.NewEncoder(conn).Encode(h.Handle(ctx, r))
 }
 

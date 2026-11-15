@@ -108,7 +108,7 @@ func New(cfg Config) (*Agent, error) {
 		backoffBase:  time.Second,
 		backoffMax:   time.Minute,
 		runUndo: func(ctx context.Context, command string) int {
-			return shellUndo(ctx, command, SocketPath(cfg.StateDir))
+			return shellUndo(ctx, command, SocketPath(cfg.StateDir), workDir(cfg.StateDir))
 		},
 		approvalWait: 10 * time.Minute,
 		pending:      map[string]pendingCall{},
@@ -326,12 +326,7 @@ func (a *Agent) handle(ctx context.Context, m incoming) {
 			p.decision <- m.Decision
 		}
 	case "undo":
-		if m.Grant != nil {
-			a.mu.Lock()
-			a.grants[m.Command] = *m.Grant
-			a.mu.Unlock()
-		}
-		go a.handleUndo(ctx, m.ToolCallID, m.Command)
+		go a.handleUndo(ctx, m.ToolCallID, m.Command, m.Grant)
 	}
 }
 
@@ -388,10 +383,13 @@ func (a *Agent) writeLatest(m metricsMsg) {
 
 func latestPath(stateDir string) string { return filepath.Join(stateDir, "latest-metrics.json") }
 
+func workDir(stateDir string) string { return filepath.Join(stateDir, "work") }
+
 // handleUndo runs an undo only if it is byte for byte one this agent recorded
 // on an approved action. The backend is a trust boundary: without this check
 // a compromised backend could run any command on every connected server.
-func (a *Agent) handleUndo(ctx context.Context, id int64, command string) {
+// A grant only becomes usable once the undo has passed the ledger.
+func (a *Agent) handleUndo(ctx context.Context, id int64, command string, grant *priv.Grant) {
 	code := refusedExitCode
 	tier, _ := classify.Command(command)
 	switch {
@@ -400,7 +398,13 @@ func (a *Agent) handleUndo(ctx context.Context, id int64, command string) {
 	case !a.audit.hasUndo(command):
 		log.Printf("undo %d refused: not an undo this agent recorded", id)
 	default:
+		if grant != nil {
+			a.mu.Lock()
+			a.grants[command] = *grant
+			a.mu.Unlock()
+		}
 		code = a.runUndo(ctx, command)
+		a.takeGrant(command) // one the undo did not use must not outlive it
 	}
 	if err := a.audit.write(auditRecord{Event: "undo", Command: command, ExitCode: &code}); err != nil {
 		log.Printf("audit: %v", err)
@@ -408,10 +412,13 @@ func (a *Agent) handleUndo(ctx context.Context, id int64, command string) {
 	a.sendReliable(undoResultMsg{"undo_result", id, code})
 }
 
-func shellUndo(ctx context.Context, command, socket string) int {
+// shellUndo runs in Claude's work directory, the one the classifier resolved
+// the undo's relative paths against.
+func shellUndo(ctx context.Context, command, socket, dir string) int {
 	ctx, cancel := context.WithTimeout(ctx, undoTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	cmd.Dir = dir
 	cmd.Env = append(childEnv(os.Environ(), "subscription"), socketEnv+"="+socket)
 	err := cmd.Run()
 	var exit *exec.ExitError
@@ -692,7 +699,11 @@ func (l *auditLog) hasUndo(command string) bool {
 	s.Buffer(make([]byte, 64*1024), 1<<20)
 	for s.Scan() {
 		var r auditRecord
-		if json.Unmarshal(s.Bytes(), &r) == nil && (r.Decision == "auto" || r.Decision == "approved") && r.Undo == command {
+		if json.Unmarshal(s.Bytes(), &r) != nil || r.Undo != command || r.Decision != "auto" && r.Decision != "approved" {
+			continue
+		}
+		// A privileged undo counts only on a privileged action, which the owner allowed seeing it.
+		if !strings.HasPrefix(command, priv.Prefix) || strings.HasPrefix(r.Command, priv.Prefix) {
 			return true
 		}
 	}

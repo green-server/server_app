@@ -81,6 +81,13 @@ var wrappers = map[string]wrapper{
 	"unbuffer":        {},
 }
 
+// The install layout (install.sh): the agent's home, and the directory the
+// agent starts Claude in. ~ and relative paths are resolved against these.
+const (
+	home    = "/var/lib/greenserver"
+	workDir = home + "/state/work"
+)
+
 var (
 	readVerbs      = set(`status is-active is-enabled is-failed list-units list-unit-files list-timers list-sockets list-dependencies get-default`)
 	hostPowerVerbs = set(`poweroff reboot halt suspend hibernate hybrid-sleep kexec rescue emergency`)
@@ -95,7 +102,7 @@ var (
 	dotEnv     = regexp.MustCompile(`^\.env($|[._-])`)
 	rawDisk    = regexp.MustCompile(`^/dev/(sd|hd|vd|xvd|nvme|mmcblk|dm-|md|loop|mem$|kmem$|port$)`)
 
-	dangerousEnv = regexp.MustCompile(`^(LD_.*|DYLD_.*|BASH_ENV|ENV|IFS|PATH|SHELLOPTS|BASHOPTS|PS[0-9]|PROMPT_COMMAND|NODE_OPTIONS|PYTHONPATH|PYTHONSTARTUP|PERL5OPT|PERL5LIB|RUBYOPT|PAGER|SYSTEMD_PAGER|SYSTEMD_EDITOR|LESSOPEN|LESSCLOSE|EDITOR|VISUAL)$`)
+	dangerousEnv = regexp.MustCompile(`^(LD_.*|DYLD_.*|BASH_ENV|ENV|IFS|PATH|HOME|CDPATH|OLDPWD|PWD|SHELLOPTS|BASHOPTS|PS[0-9]|PROMPT_COMMAND|NODE_OPTIONS|PYTHONPATH|PYTHONSTARTUP|PERL5OPT|PERL5LIB|RUBYOPT|PAGER|SYSTEMD_PAGER|SYSTEMD_EDITOR|LESSOPEN|LESSCLOSE|EDITOR|VISUAL)$`)
 	harmlessEnv  = regexp.MustCompile(`^(LANG|LANGUAGE|LC_[A-Z]+|TZ|TERM|COLUMNS|LINES|NO_COLOR)$`)
 )
 

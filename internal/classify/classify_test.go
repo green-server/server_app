@@ -302,3 +302,57 @@ func FuzzCommand(f *testing.F) {
 		}
 	})
 }
+
+// The classifier refuses what the root helper would, so it is never asked.
+func TestPrivilegedShapesMatchTheHelper(t *testing.T) {
+	want(t, Deny, []string{
+		"greenserver priv systemctl start poweroff.target", "greenserver priv systemctl start reboot.target",
+		"greenserver priv systemctl start halt.target", "greenserver priv systemctl start rescue.target",
+		"greenserver priv systemctl stop ssh.socket", "greenserver priv systemctl stop sshd.socket",
+		"greenserver priv systemctl stop docker.socket", "greenserver priv systemctl stop dbus.socket",
+		"greenserver priv systemctl stop user@1000", "greenserver priv systemctl stop getty@tty1",
+		"greenserver priv docker stop 3f2a9c1b7d4e", "greenserver priv docker stop dokploy", "greenserver priv docker exec x sh",
+		"greenserver priv systemctl stop $X", "/usr/local/bin/greenserver priv systemctl start poweroff.target",
+		"ls; greenserver priv systemctl start poweroff.target",
+	})
+	want(t, Approve, []string{"greenserver priv docker restart minecraft-server", "greenserver priv systemctl stop nginx"})
+}
+
+// An owner clicking undo gets the undo signed, so a privileged undo on an
+// action nobody allowed would be a root grant nobody approved.
+func TestPrivilegedUndoNeedsAPrivilegedAction(t *testing.T) {
+	for _, c := range []string{
+		"touch /tmp/x # undo: greenserver priv systemctl stop nginx",
+		"sudo -n systemctl stop nginx # undo: greenserver priv systemctl start nginx",
+	} {
+		if v := eval(t, c); !v.Blocked {
+			t.Errorf("%q not blocked: %+v", c, v)
+		}
+	}
+	if v := eval(t, "greenserver priv docker stop mc # undo: greenserver priv docker start mc"); v.Blocked || v.Tier != Approve {
+		t.Fatalf("%+v", v)
+	}
+}
+
+// Relative paths and ~ are resolved against the work directory and the home,
+// and against every directory a cd in the command may lead to.
+func TestRelativePathsAreResolved(t *testing.T) {
+	want(t, Deny, []string{
+		"echo x >> ../../.bashrc", "echo x >> ~/.bashrc", "echo x >> ~greenserver/.bashrc", "echo x >> $HOME/.bashrc", "echo x >> ${HOME}/.profile",
+		"echo x >> /var/lib/greenserver/.bashrc", "cp x ../../.bashrc", "sed -i s/a/b/ ~/.profile", "tee -a ../../.bashrc",
+		"cd /var/lib/greenserver && echo x >> .bashrc", "cd /var/lib/greenserver; tee -a .bashrc", "cd ~ && echo x >> .bashrc", "cd && echo x >> .bashrc",
+		"cd .. && echo x > other", "cd /var/lib && echo x >> greenserver/.bashrc", "(cd /tmp); cd /var/lib/greenserver; echo x >> .bashrc",
+		"f() { echo x >> .bashrc; }; cd ~; f", "for i in 1 2; do echo x >> .bashrc; cd ..; done",
+		"echo x > .claude/settings.json", "mkdir -p .claude", "echo x > ~/.claude/settings.json",
+		"cd $DIR && ls", `cd "$(echo /var/lib/greenserver)" && echo x >> .bashrc`, "cd - && ls", "cd /var/lib/green* && ls", "cd nginx && ls", "cd $PWD/x && ls",
+		"HOME=/tmp; cd; ls", "CDPATH=/var/lib/greenserver cd state", "OLDPWD=/x; ls", "PWD=/var/lib/greenserver; echo x >> $PWD/.bashrc",
+		"cat ../../../../../etc/greenserver/env", "cd /etc/greenserver && cat env", "cd /etc/ssl && cat private/server.crt", "cat $HOME/../../../etc/greenserver/env",
+	})
+	want(t, Approve, []string{
+		"echo x > out.txt", "echo x > /var/lib/greenserver/state/work/out.txt", "cd /etc/nginx && sed -i s/a/b/ nginx.conf", "cd /tmp && echo x > y",
+	})
+	want(t, Auto, []string{"cd /var/log && ls", "cd && ls", "ls ~", "echo $HOME", "cd /var/log/nginx && tail -n 5 access.log", "cd /var/log; cd /tmp; ls"})
+	if v := Evaluate("Read", json.RawMessage(`{"file_path":"../../../../../etc/greenserver/env"}`)); v.Tier != Deny {
+		t.Errorf("relative secret read: %+v", v)
+	}
+}

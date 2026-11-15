@@ -360,7 +360,11 @@ func (p *parser) dollar() error {
 }
 
 func (p *parser) variable(name, raw string) {
-	if safeVars[name] {
+	switch {
+	case name == "HOME":
+		p.expansion(raw, home, false) // so a secret under it is still seen
+		return
+	case safeVars[name]:
 		p.expansion(raw, "x", false)
 		return
 	}

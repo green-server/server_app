@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -466,6 +467,44 @@ func TestUndoRunsOnlyWhatWasRecorded(t *testing.T) {
 	}
 }
 
+// A grant arriving with an undo is only usable once the ledger has accepted
+// that undo, and a privileged undo is only accepted on a privileged action.
+func TestUndoGrantNeedsTheLedger(t *testing.T) {
+	a, b, c := connected(t)
+	sock := SocketPath(a.cfg.StateDir)
+	stopNginx, startMC := "greenserver priv systemctl stop nginx", "greenserver priv docker start mc"
+	a.audit.write(auditRecord{Event: "call", Decision: "auto", Command: "touch /tmp/x", Undo: stopNginx})
+	a.audit.write(auditRecord{Event: "call", Decision: "approved", Command: "greenserver priv docker stop mc", Undo: startMC})
+	grant := map[string]any{"expires": 9, "nonce": "n", "signature": "s"}
+	for i, command := range []string{stopNginx, "greenserver priv systemctl stop never-recorded"} {
+		tell(t, c, map[string]any{"type": "undo", "toolCallId": 30 + i, "command": command, "grant": grant})
+		if m := b.expect("undo_result"); m["exitCode"] != float64(refusedExitCode) {
+			t.Fatalf("%q: %v", command, m)
+		}
+		if _, err := TakeGrant(sock, command); err == nil {
+			t.Fatalf("%q: refused undo left a grant", command)
+		}
+	}
+
+	var granted atomic.Bool
+	a.runUndo = func(_ context.Context, command string) int {
+		granted.Store(a.takeGrant(command).Allow)
+		return 0
+	}
+	tell(t, c, map[string]any{"type": "undo", "toolCallId": 40, "command": startMC, "grant": grant})
+	if m := b.expect("undo_result"); m["exitCode"] != float64(0) || !granted.Load() {
+		t.Fatalf("%v granted=%v", m, granted.Load())
+	}
+}
+
+// Undo runs where Claude ran, which is what its relative paths were checked against.
+func TestShellUndoRunsInTheWorkDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if code := shellUndo(context.Background(), `test "$(pwd -P)" = "$(cd '`+dir+`' && pwd -P)"`, "/nonexistent", dir); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+}
+
 func TestClaudeArgsForceAutoModeAndModel(t *testing.T) {
 	args := strings.Join(claudeArgs("claude-opus-5-5", 5, "/bin/gs", "/tmp/s"), " ")
 	for _, want := range []string{"--permission-mode auto", "--model claude-opus-5-5", "--permission-prompt-tool", `"timeout":660`} {
@@ -712,6 +751,9 @@ func TestChildEnv(t *testing.T) {
 	sub := childEnv(env, "subscription")
 	if has(sub, "ANTHROPIC_API_KEY") || has(sub, "ANTHROPIC_AUTH_TOKEN") || has(sub, "GREENSERVER_TOKEN") || !has(sub, "HOME") {
 		t.Fatalf("%v", sub)
+	}
+	if !slices.Contains(sub, "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1") {
+		t.Fatalf("Bash cwd must not carry over between calls: %v", sub)
 	}
 	key := childEnv(env, "api_key")
 	if !has(key, "ANTHROPIC_API_KEY") || has(key, "GREENSERVER_TOKEN") {

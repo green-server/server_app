@@ -10,7 +10,10 @@ import (
 	"encoding/json"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
+
+	"github.com/green-server/server_app/internal/priv"
 )
 
 type Tier string
@@ -34,6 +37,7 @@ func rank(t Tier) int {
 const (
 	maxDepth   = 6
 	maxCommand = 64 * 1024
+	maxDirs    = 8 // directories a command may cd into before it is refused
 )
 
 // Verdict is the decision on one tool call.
@@ -60,7 +64,7 @@ func Evaluate(tool string, input json.RawMessage) Verdict {
 	switch tool {
 	case "Read":
 		v := Verdict{Tier: Auto, Command: "Read " + in.FilePath}
-		if in.FilePath == "" || secretPath(in.FilePath, false) {
+		if in.FilePath == "" || newWalker(nil).secret(in.FilePath, false) {
 			v.Tier, v.Reason, v.Blocked = Deny, "secret file", true
 		}
 		return v
@@ -84,7 +88,7 @@ func evaluateBash(command string) Verdict {
 	case Deny:
 		v.Blocked = true
 	case Approve:
-		if why := undoProblem(v.Undo); why != "" {
+		if why := undoProblem(v.Command, v.Undo); why != "" {
 			v.Blocked, v.Reason = true, why
 		}
 	}
@@ -95,9 +99,14 @@ func evaluateBash(command string) Verdict {
 // "". A real undo changes state again, so it must itself be approve tier: an
 // auto-tier no-op such as "true" would satisfy the rule while undoing nothing,
 // and a deny-tier one would become a way to run a denied command later.
-func undoProblem(undo string) string {
+// A privileged undo is signed when the owner clicks undo, so it may only back
+// a privileged action, whose undo the owner already saw when allowing it.
+func undoProblem(command, undo string) string {
 	if undo == "" {
 		return `approve-tier command needs an undo: end it with a comment "# undo: <command that reverts it>"`
+	}
+	if strings.HasPrefix(undo, priv.Prefix) && !strings.HasPrefix(command, priv.Prefix) {
+		return "a privileged undo can only revert a privileged command"
 	}
 	switch t, why := Command(undo); t {
 	case Approve:
@@ -110,13 +119,23 @@ func undoProblem(undo string) string {
 }
 
 // Command returns the strictest tier found anywhere in a shell command line.
+//
+// A relative path is checked against every directory a cd in the command may
+// lead to. A loop or a function can run a line before a cd written after it,
+// so the walk repeats once with every directory the first walk found.
 func Command(src string) (Tier, string) {
-	w := &walker{tier: Auto}
-	w.script(src, 0)
-	if w.downloads && w.execs {
-		w.raise(Deny, "downloads and then executes code")
+	dirs := []string{workDir}
+	for {
+		w := newWalker(dirs)
+		w.script(src, 0)
+		if len(w.dirs) == len(dirs) || w.tier == Deny {
+			if w.downloads && w.execs {
+				w.raise(Deny, "downloads and then executes code")
+			}
+			return w.tier, w.reason
+		}
+		dirs = w.dirs
 	}
-	return w.tier, w.reason
 }
 
 type walker struct {
@@ -124,7 +143,15 @@ type walker struct {
 	reason    string
 	downloads bool
 	execs     bool
-	probe     bool // deny-only re-check of a fragment; suppresses further probing
+	probe     bool     // deny-only re-check of a fragment; suppresses further probing
+	dirs      []string // where the shell may be; relative paths are resolved against each
+}
+
+func newWalker(dirs []string) *walker {
+	if len(dirs) == 0 {
+		dirs = []string{workDir}
+	}
+	return &walker{tier: Auto, dirs: slices.Clone(dirs)}
 }
 
 func (w *walker) raise(t Tier, why string) {
@@ -163,7 +190,7 @@ func (w *walker) redirects(rs []redirect) {
 		if strings.HasPrefix(r.op, "<<") {
 			continue // a heredoc delimiter or here-string body is not a file
 		}
-		if referencesSecret(r.target.scan, r.target.dynamic || r.target.glob) {
+		if w.referencesSecret(r.target.scan, r.target.dynamic || r.target.glob) {
 			w.raise(Deny, "secret file")
 		}
 		if !strings.ContainsRune(r.op, '>') {
@@ -173,7 +200,7 @@ func (w *walker) redirects(rs []redirect) {
 		if dup || target == "/dev/null" || target == "/dev/stdout" || target == "/dev/stderr" {
 			continue
 		}
-		if protectedPath(target) {
+		if w.protected(target) {
 			w.raise(Deny, "write to a protected path")
 		}
 		w.raise(Approve, "writes to a file")
@@ -227,7 +254,7 @@ func (w *walker) exec(all []word, depth int) {
 	}
 	meta := metadataOnly[name]
 	for _, x := range all {
-		if referencesSecret(x.scan, x.glob && !meta || x.dynamic && !meta) {
+		if w.referencesSecret(x.scan, x.glob && !meta || x.dynamic && !meta) {
 			w.raise(Deny, "secret file or value that cannot be resolved statically")
 			return
 		}
@@ -237,6 +264,11 @@ func (w *walker) exec(all []word, depth int) {
 	}
 
 	tier, why := w.decide(name, ws[1:], depth)
+	if name == "cd" || name == "pushd" {
+		if problem := w.chdir(ws[1:]); problem != "" {
+			tier, why = Deny, problem
+		}
+	}
 	if tier == Auto {
 		if strings.Contains(ws[0].text, "/") && !systemBinary(ws[0].text) {
 			tier, why = Approve, "binary outside the system directories"
@@ -252,7 +284,7 @@ func (w *walker) exec(all []word, depth int) {
 	}
 	if tier != Auto {
 		for _, x := range all[1:] {
-			if pathsIn(x.text, protectedPath) {
+			if pathsIn(x.text, w.protected) {
 				tier, why = Deny, "touches a protected path"
 			}
 		}
@@ -280,7 +312,8 @@ func (w *walker) exec(all []word, depth int) {
 }
 
 func (w *walker) mustNotDeny(check func(*walker)) {
-	q := &walker{tier: Auto, probe: true}
+	q := newWalker(w.dirs)
+	q.probe = true
 	check(q)
 	if q.tier == Deny {
 		w.raise(Deny, q.reason)
@@ -420,6 +453,13 @@ func (w *walker) decide(name string, args []word, depth int) (Tier, string) {
 	case "powerprofilesctl":
 		if len(argv) == 0 || argv[0] == "get" || argv[0] == "list" {
 			return Auto, ""
+		}
+	case "greenserver":
+		// Refuse here what the root helper would refuse, so it is never asked.
+		if len(argv) > 0 && argv[0] == "priv" {
+			if _, err := priv.Parse(priv.Prefix + strings.Join(argv[1:], " ")); err != nil {
+				return Deny, "privileged command refused: " + err.Error()
+			}
 		}
 	case "docker":
 		if len(argv) > 0 && argv[0] == "ps" {
@@ -734,8 +774,82 @@ func pathsIn(s string, check func(string) bool) bool {
 	return false
 }
 
-func referencesSecret(scan string, wild bool) bool {
-	return pathsIn(scan, func(p string) bool { return secretPath(p, wild) })
+func (w *walker) referencesSecret(scan string, wild bool) bool {
+	return pathsIn(scan, func(p string) bool { return w.secret(p, wild) })
+}
+
+// absolute expands ~ and $HOME to the agent's home, and reports whether the
+// path is then absolute.
+func absolute(p string) (string, bool) {
+	under := func(prefix string) (string, bool) {
+		rest, ok := strings.CutPrefix(p, prefix)
+		return rest, ok && (rest == "" || rest[0] == '/')
+	}
+	for _, h := range []string{"~greenserver", "~", "$HOME", "${HOME}"} {
+		if rest, ok := under(h); ok {
+			return home + rest, true
+		}
+	}
+	for _, h := range []string{"$PWD", "${PWD}"} {
+		if rest, ok := under(h); ok {
+			p = "." + rest
+		}
+	}
+	return p, path.IsAbs(p)
+}
+
+// resolve returns every absolute path p may name: a relative path may be
+// relative to any directory in w.dirs.
+func (w *walker) resolve(p string) []string {
+	p, ok := absolute(p)
+	if ok {
+		return []string{p}
+	}
+	out := make([]string, len(w.dirs))
+	for i, d := range w.dirs {
+		out[i] = path.Join(d, p)
+	}
+	return out
+}
+
+func (w *walker) secret(p string, wild bool) bool {
+	return slices.ContainsFunc(w.resolve(p), func(r string) bool { return secretPath(r, wild) })
+}
+
+func (w *walker) protected(p string) bool {
+	return slices.ContainsFunc(w.resolve(p), protectedPath)
+}
+
+// chdir adds where a cd may lead. Directories are only ever added, so a cd in
+// a subshell or a branch that may not run still counts. The target has to be
+// a literal absolute path: one only known at run time leaves nothing to check
+// against, and a relative one repeated in a loop could climb anywhere.
+func (w *walker) chdir(args []word) string {
+	var targets []string
+	for _, a := range args {
+		switch {
+		case a.dynamic || a.glob || a.text == "-" || strings.HasPrefix(a.text, "+"):
+			return "changes to a directory only known at run time"
+		case !strings.HasPrefix(a.text, "-"):
+			targets = append(targets, a.text)
+		}
+	}
+	if len(targets) == 0 {
+		targets = []string{"~"}
+	}
+	for _, t := range targets {
+		d, ok := absolute(t)
+		if !ok {
+			return "cd needs an absolute path, so the paths after it can be checked"
+		}
+		if d = path.Clean(d); !slices.Contains(w.dirs, d) {
+			w.dirs = append(w.dirs, d)
+		}
+	}
+	if len(w.dirs) > maxDirs {
+		return "changes directory too often to follow"
+	}
+	return ""
 }
 
 func secretPath(p string, wild bool) bool {
@@ -799,10 +913,16 @@ func secretName(base string) bool {
 		strings.HasPrefix(base, "id_ecdsa") || strings.HasPrefix(base, "id_ed25519")
 }
 
+// protectedPath takes an absolute path. The work directory is the one place in
+// the agent's home Claude may write, except for Claude Code's own settings,
+// which can add hooks that run without passing through here.
 func protectedPath(p string) bool {
 	clean := path.Clean(p)
-	if rawDisk.MatchString(clean) {
+	if rawDisk.MatchString(clean) || slices.Contains(strings.Split(clean, "/"), ".claude") {
 		return true
+	}
+	if clean == workDir || strings.HasPrefix(clean, workDir+"/") {
+		return protectedNames[path.Base(clean)]
 	}
 	for _, prefix := range protectedPrefixes {
 		if clean == prefix || strings.HasPrefix(clean, prefix+"/") {
